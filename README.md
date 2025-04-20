@@ -41,5 +41,5 @@ If you use this code or framework, please cite:
   year         = {2025},
   howpublished = {arXiv preprint},
   note         = {Parts I & II},
-  url          = {https://arxiv.org/abs/25xx.xxxxx}
+  url          = {https://arxiv.org/abs/25xx.xxxxx} (not yet published)
 }
