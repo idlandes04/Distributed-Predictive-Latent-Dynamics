@@ -2,31 +2,30 @@ import torch
 import argparse
 import numpy as np
 import os
+import time
+import math # Import math for checking finite values
 
-from core import DPLDSystem
-from envs import LorenzEnv
+# Import necessary components from core.py
+from core import DPLDSystem, DEFAULT_ACTION_STD # <<< IMPORT ADDED HERE
 from utils import Logger, plot_metrics
 
 def noise_schedule_const(step, std_dev=0.05):
-    """Constant noise schedule."""
     return std_dev
 
 def noise_schedule_anneal(step, start_std=0.1, end_std=0.01, anneal_steps=10000):
-    """Linearly annealing noise schedule."""
     anneal_frac = min(1.0, step / anneal_steps)
     return start_std - (start_std - end_std) * anneal_frac
 
 def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
-    print(f"Using device: {device}")
-
-    # --- Environment ---
-    # For MVP, environment is just used to potentially initialize CLS,
-    # but DPLD runs its internal dynamics prediction loop.
-    # env = LorenzEnv(device=device)
-    # env_dim = env.get_dimension()
-    # We could have a module that takes Lorenz state as input, but MVP focuses
-    # on CLS predicting its own next state based on internal dynamics.
+    if args.use_gpu and torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+    elif args.use_gpu:
+        print("Warning: --use-gpu specified but CUDA not available. Using CPU.")
+        device = torch.device("cpu")
+    else:
+        print("Using CPU.")
+        device = torch.device("cpu")
 
     # --- Noise Schedule ---
     if args.noise_anneal > 0:
@@ -49,6 +48,8 @@ def main(args):
         gamma_min=args.gamma_min,
         gamma_max=args.gamma_max,
         stability_target=args.stability_target,
+        action_std=args.action_std,
+        clip_cls_norm=not args.no_clip_cls_norm,
         device=device
     ).to(device)
 
@@ -62,42 +63,73 @@ def main(args):
     print(f"  Meta LR: {args.meta_lr}")
     print(f"  Gamma Range: [{args.gamma_min}, {args.gamma_max}]")
     print(f"  Stability Target (lambda_thr): {args.stability_target}")
+    print(f"  Action Noise Std: {args.action_std}")
+    print(f"  Clip CLS Norm: {not args.no_clip_cls_norm}")
 
 
-    # --- Logger ---
     logger = Logger(log_dir=args.log_dir, run_name=args.run_name)
 
-    # --- Training Loop ---
     print("Starting training...")
+    start_time = time.time()
     for step in range(args.total_steps):
-        # Run one step of the DPLD internal dynamics
-        metrics = dpld_system.step(step)
+        estimate_le_this_step = (args.le_interval > 0 and step % args.le_interval == 0)
 
-        # Logging
-        if step % args.log_interval == 0:
+        try:
+            metrics = dpld_system.step(step, estimate_le=estimate_le_this_step)
+        except Exception as e:
+             print(f"\nERROR during DPLD step {step}: {e}")
+             import traceback
+             traceback.print_exc()
+             print("Aborting training.")
+             break # Stop training loop on error
+
+
+        if step % args.log_interval == 0 or step == args.total_steps - 1:
             logger.log(step, metrics)
+            if step > 0 and args.log_interval > 0 : # Avoid division by zero and excessive printing
+                 elapsed_time = time.time() - start_time
+                 steps_per_sec = (step + 1) / elapsed_time # Use step+1 for current avg
+                 remaining_steps = args.total_steps - (step + 1)
+                 # Handle potential division by zero if steps_per_sec is 0
+                 eta_seconds = remaining_steps / steps_per_sec if steps_per_sec > 0 else float('inf')
+                 if math.isfinite(eta_seconds):
+                     eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+                     print(f"    ETA: {eta_str} ({steps_per_sec:.2f} steps/sec)")
+                 else:
+                     print(f"    ETA: Inf ({steps_per_sec:.2f} steps/sec)")
 
-        # Optional: Checkpointing
-        # if step % args.save_interval == 0 and step > 0:
-        #     save_path = os.path.join(logger.log_dir, f"model_step_{step}.pt")
-        #     torch.save(dpld_system.state_dict(), save_path)
-        #     print(f"Checkpoint saved to {save_path}")
 
-        # Optional: Estimate Lyapunov exponent periodically (can be slow)
-        # if step % args.le_interval == 0 and step > 0:
-        #     print("Estimating Lyapunov Exponent...")
-        #     dynamics_map_fn = dpld_system.get_dynamics_map()
-        #     le_estimate = estimate_lyapunov_exponent(dynamics_map_fn, dpld_system.ct, device=device)
-        #     print(f"Step {step} Estimated LE: {le_estimate:.4f}")
-        #     # Could log this LE estimate as well
-        #     logger.log(step, {"lambda_max_estimated_periodic": le_estimate})
+        if args.save_interval > 0 and step % args.save_interval == 0 and step > 0:
+            save_dir = os.path.join(logger.log_dir, "checkpoints")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"model_step_{step}.pt")
+            try:
+                torch.save(dpld_system.state_dict(), save_path)
+                print(f"    Checkpoint saved to {save_path}")
+            except Exception as e:
+                print(f"    Error saving checkpoint: {e}")
+
+        # --- Check for NaN in critical metrics ---
+        if metrics is not None and (
+            ('Gt' in metrics and metrics['Gt'] is not None and not math.isfinite(metrics['Gt'])) or
+            ('cls_norm' in metrics and metrics['cls_norm'] is not None and not math.isfinite(metrics['cls_norm']))
+        ):
+             print(f"\nERROR: Non-finite metric detected at step {step}. Gt: {metrics.get('Gt')}, cls_norm: {metrics.get('cls_norm')}")
+             print("Aborting training due to instability.")
+             break
 
 
     print("Training finished.")
+    total_time = time.time() - start_time
+    print(f"Total training time: {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
     logger.close()
 
-    # --- Plotting ---
-    plot_metrics(logger.csv_path)
+    print("Generating plot...")
+    # Add try-except block for plotting as well
+    try:
+        plot_metrics(logger.csv_path)
+    except Exception as e:
+        print(f"Error generating plot: {e}")
 
 
 if __name__ == "__main__":
@@ -111,25 +143,29 @@ if __name__ == "__main__":
     parser.add_argument('--k-sparse', type=float, default=0.05, help='Sparsity fraction for module writes (k)')
 
     # Learning Parameters
-    parser.add_argument('--module-lr', type=float, default=1e-4, help='Learning rate for modules')
+    parser.add_argument('--module-lr', type=float, default=5e-5, help='Learning rate for modules (reduced default)')
     parser.add_argument('--meta-lr', type=float, default=1e-4, help='Learning rate for meta-model')
     parser.add_argument('--total-steps', type=int, default=50000, help='Total training steps')
 
     # Dynamics Parameters
-    parser.add_argument('--gamma-min', type=float, default=0.01, help='Minimum global decay rate')
-    parser.add_argument('--gamma-max', type=float, default=0.2, help='Maximum global decay rate')
+    parser.add_argument('--gamma-min', type=float, default=0.05, help='Minimum global decay rate (increased default)')
+    parser.add_argument('--gamma-max', type=float, default=0.3, help='Maximum global decay rate (increased default)')
     parser.add_argument('--stability-target', type=float, default=0.05, help='Target for lambda_max (lambda_thr)')
-    parser.add_argument('--noise-start', type=float, default=0.1, help='Initial/constant noise std dev')
+    parser.add_argument('--noise-start', type=float, default=0.05, help='Initial/constant noise std dev (reduced default)')
     parser.add_argument('--noise-end', type=float, default=0.01, help='Final noise std dev for annealing')
     parser.add_argument('--noise-anneal', type=int, default=10000, help='Steps to anneal noise over (0 for constant)')
+    # Use the imported constant for the default value
+    parser.add_argument('--action-std', type=float, default=DEFAULT_ACTION_STD, help='Std dev for sampling module write actions')
+    parser.add_argument('--no-clip-cls-norm', action='store_true', help='Disable CLS norm clipping')
+
 
     # Logging & Setup
     parser.add_argument('--log-interval', type=int, default=100, help='Steps between logging metrics')
-    parser.add_argument('--le-interval', type=int, default=1000, help='Steps between estimating LE (can be slow)')
+    parser.add_argument('--le-interval', type=int, default=1000, help='Steps between estimating LE (0 to disable)')
+    parser.add_argument('--save-interval', type=int, default=5000, help='Steps between saving model checkpoints (0 to disable)')
     parser.add_argument('--log-dir', type=str, default='logs', help='Directory for logs and checkpoints')
     parser.add_argument('--run-name', type=str, default=None, help='Specific name for this run')
     parser.add_argument('--use-gpu', action='store_true', help='Use GPU if available')
-    # parser.add_argument('--save-interval', type=int, default=5000, help='Steps between saving model checkpoints')
 
 
     args = parser.parse_args()

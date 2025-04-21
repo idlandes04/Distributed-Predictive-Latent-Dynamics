@@ -1,0 +1,18 @@
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Checkpoint models (ignore .pt step files)
+*.pt
+
+# Ignore logs but keep metrics CSV and plots
+logs/**
+!logs/**/metrics.csv
+!logs/**/metrics_plot.png
+
+# VSCode and system files
+.vscode/
+.DS_Store
+
+# Markdown temp or backup files
+*.md~

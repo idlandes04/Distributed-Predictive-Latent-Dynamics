@@ -20,9 +20,12 @@ class Logger:
 
     def log(self, step, metrics_dict):
         """Logs metrics to console and CSV."""
-        self.metrics = {"step": step, **metrics_dict}
+        # Filter out None values before logging
+        loggable_metrics = {k: v for k, v in metrics_dict.items() if v is not None}
+        self.metrics = {"step": step, **loggable_metrics}
+
         print(f"Step: {step}", end="")
-        for k, v in metrics_dict.items():
+        for k, v in loggable_metrics.items():
             if isinstance(v, torch.Tensor):
                 v = v.item()
             if isinstance(v, (float, np.float32, np.float64)):
@@ -31,17 +34,22 @@ class Logger:
                  print(f" | {k}: {v}", end="")
         print() # Newline
 
-        # Write to CSV
-        if not self.header_written:
-            with open(self.csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(self.metrics.keys())
-                self.header_written = True
+        # Prepare data row ensuring order matches header if written, handle missing keys
+        if self.header_written:
+            data_row = [self.metrics.get(k, '') for k in self.header_keys]
+        else:
+            self.header_keys = list(self.metrics.keys()) # Store header order
+            data_row = list(self.metrics.values())
 
-        with open(self.csv_path, 'a', newline='') as f:
+
+        # Write to CSV
+        mode = 'a' if self.header_written else 'w'
+        with open(self.csv_path, mode, newline='') as f:
             writer = csv.writer(f)
-            # Ensure order matches header if dict order changes (Python 3.7+)
-            writer.writerow([self.metrics.get(k, '') for k in self.metrics.keys()])
+            if not self.header_written:
+                writer.writerow(self.header_keys)
+                self.header_written = True
+            writer.writerow(data_row)
 
 
     def close(self):
@@ -59,12 +67,16 @@ def plot_metrics(log_file, metrics_to_plot=None):
         print(f"Error reading log file: {e}")
         return
 
+    if df.empty:
+        print("Log file is empty.")
+        return
+
     if metrics_to_plot is None:
-        metrics_to_plot = [col for col in df.columns if col != 'step']
+        metrics_to_plot = [col for col in df.columns if col != 'step' and pd.api.types.is_numeric_dtype(df[col])]
 
     num_plots = len(metrics_to_plot)
     if num_plots == 0:
-        print("No metrics to plot.")
+        print("No numeric metrics found to plot.")
         return
 
     cols = int(np.ceil(np.sqrt(num_plots)))
@@ -73,24 +85,37 @@ def plot_metrics(log_file, metrics_to_plot=None):
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
     axes = axes.flatten()
 
-    for i, metric in enumerate(metrics_to_plot):
+    plot_count = 0
+    for metric in metrics_to_plot:
         if metric in df.columns:
-            axes[i].plot(df['step'], df[metric])
-            axes[i].set_title(metric)
-            axes[i].set_xlabel("Step")
-            axes[i].set_ylabel(metric)
-            axes[i].grid(True)
+            # Drop rows where the metric might be NaN or non-numeric after load
+            plot_data = df[['step', metric]].dropna()
+            if not plot_data.empty:
+                axes[plot_count].plot(plot_data['step'], plot_data[metric])
+                axes[plot_count].set_title(metric)
+                axes[plot_count].set_xlabel("Step")
+                axes[plot_count].set_ylabel(metric)
+                axes[plot_count].grid(True)
+                plot_count += 1
+            else:
+                 print(f"Warning: Metric '{metric}' has no plottable data.")
         else:
             print(f"Warning: Metric '{metric}' not found in log file.")
-            axes[i].set_title(f"{metric} (Not Found)")
-            axes[i].axis('off') # Hide unused subplot
+
 
     # Hide any remaining empty subplots
-    for j in range(i + 1, len(axes)):
+    for j in range(plot_count, len(axes)):
         axes[j].axis('off')
 
     plt.tight_layout()
-    plt.show()
+    # Save the plot instead of showing interactively
+    plot_filename = os.path.splitext(log_file)[0] + "_plot.png"
+    try:
+        plt.savefig(plot_filename)
+        print(f"Metrics plot saved to {plot_filename}")
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+    plt.close(fig) # Close the figure to free memory
 
 
 def estimate_lyapunov_exponent(dynamics_map_fn, state, n_vectors=5, steps=50, epsilon=1e-5, device='cpu'):
@@ -101,81 +126,108 @@ def estimate_lyapunov_exponent(dynamics_map_fn, state, n_vectors=5, steps=50, ep
     Args:
         dynamics_map_fn: A function that takes a state tensor (ct) and returns
                          the next state tensor (ct+1). Must be differentiable.
-        state: The starting state tensor (shape [D]).
+                         IMPORTANT: This map should represent a *fixed* dynamic
+                         for the duration of the estimation steps.
+        state: The starting state tensor (shape [D]). Assumed DENSE.
         n_vectors: Number of orthonormal vectors to track (k in Alg 2).
         steps: Number of steps for averaging (T in Alg 2).
         epsilon: Small perturbation for JVP calculation if needed (often not).
         device: Torch device.
 
     Returns:
-        Estimated largest Lyapunov exponent (lambda_max).
+        Estimated largest Lyapunov exponent (lambda_max). Returns None if estimation fails.
     """
-    D = state.shape[0]
-    if D < n_vectors:
-        print(f"Warning: State dimension {D} < n_vectors {n_vectors}. Reducing n_vectors.")
-        n_vectors = D
+    with torch.no_grad(): # Ensure no gradients are computed within LE estimation itself
+        D = state.shape[0]
+        if D < n_vectors:
+            print(f"Warning: State dimension {D} < n_vectors {n_vectors}. Reducing n_vectors.")
+            n_vectors = D
+        if n_vectors == 0: return None # Cannot estimate with 0 vectors
 
-    # Initialize orthonormal vectors (columns of Q)
-    q_matrix = torch.linalg.qr(torch.randn(D, n_vectors, device=device))[0]
+        # Initialize orthonormal vectors (columns of Q)
+        try:
+            q_matrix = torch.linalg.qr(torch.randn(D, n_vectors, device=device))[0]
+        except torch.linalg.LinAlgError:
+             print("Error: QR decomposition failed during LE initialization.")
+             return None
 
-    log_stretch_sum = 0.0
 
-    current_state = state.detach().clone()
+        log_stretch_sum = 0.0
+        current_state = state.detach().clone() # Ensure it's a detached copy
 
-    for _ in range(steps):
-        # Ensure state requires grad for JVP
-        current_state_detached = current_state.detach()
-        
-        # Function to compute JVP: J @ v
-        def jvp_fn(v):
-            # We need the Jacobian of dynamics_map_fn w.r.t current_state
-            # Use torch.func API for vmap over basis vectors if needed,
-            # or loop for simplicity in MVP
-            
-            # Use autograd.functional.jvp
-            # Need a function that takes *only* the state
-            map_fn_for_jvp = lambda s: dynamics_map_fn(s)
-
+    # --- JVP Calculation Function ---
+    # This function needs gradients enabled temporarily
+    def jvp_fn(v_in):
+        # We need the Jacobian of dynamics_map_fn w.r.t current_state_detached
+        current_state_detached = current_state.detach().requires_grad_(True)
+        # Use autograd.functional.jvp
+        map_fn_for_jvp = lambda s: dynamics_map_fn(s)
+        try:
             _, output_tangent = torch.autograd.functional.jvp(
-                map_fn_for_jvp, current_state_detached, v, create_graph=False # No gradients through LE estimation needed
+                map_fn_for_jvp, current_state_detached, v_in, create_graph=False
             )
             return output_tangent
+        except Exception as e:
+             print(f"Error during JVP calculation: {e}")
+             return None # Signal failure
 
+
+    # --- Main LE Estimation Loop ---
+    for step_num in range(steps):
         # Compute JVPs for all vectors in q_matrix
-        v_matrix = torch.zeros_like(q_matrix)
+        v_list = []
         for i in range(n_vectors):
-            v_matrix[:, i] = jvp_fn(q_matrix[:, i])
+            v_out = jvp_fn(q_matrix[:, i])
+            if v_out is None: return None # Propagate JVP failure
+            v_list.append(v_out)
 
-        # QR decomposition of the resulting vectors
-        # V = Q' R'
+        if not v_list: return None # Should not happen if n_vectors > 0
+
+        v_matrix = torch.stack(v_list, dim=1)
+
+        # QR decomposition of the resulting vectors: V = Q' R'
         try:
+            # Need to handle potential non-finite values coming from JVP
+            if not torch.all(torch.isfinite(v_matrix)):
+                 print(f"Warning: Non-finite values in JVP result at LE step {step_num}. Skipping.")
+                 # Attempt recovery: Re-orthogonalize q_matrix and continue
+                 q_matrix = torch.linalg.qr(torch.randn(D, n_vectors, device=device))[0]
+                 continue
+
             q_prime, r_prime = torch.linalg.qr(v_matrix)
         except torch.linalg.LinAlgError:
-             print("Warning: QR decomposition failed during Lyapunov estimation. Returning 0.")
-             # Handle potential numerical issues, e.g., if vectors become linearly dependent
-             # Or if the Jacobian leads to non-finite values
-             # A simple recovery is to re-orthogonalize q_matrix and continue, or return 0
+             print(f"Warning: QR decomposition failed during LE step {step_num}. Skipping.")
+             # Attempt recovery: Re-orthogonalize q_matrix and continue
              q_matrix = torch.linalg.qr(torch.randn(D, n_vectors, device=device))[0]
              continue # Skip this step's contribution
 
+
         # Accumulate the log of the diagonal elements of R' (stretching factors)
-        # Ensure diagonal elements are positive before log
-        log_stretch_sum += torch.sum(torch.log(torch.abs(torch.diag(r_prime))))
+        # Ensure diagonal elements are non-zero before log
+        diag_r = torch.diag(r_prime)
+        # Clamp small values away from zero for stability
+        safe_diag_r = torch.clamp(torch.abs(diag_r), min=1e-9)
+        log_stretch_sum += torch.sum(torch.log(safe_diag_r))
 
         # Update orthonormal vectors for the next step
         q_matrix = q_prime
 
-        # Update the state for the next iteration (outside JVP calculation)
+        # Update the state for the next iteration using the original dynamics map
+        # Do this outside JVP calculation, no gradients needed here
         with torch.no_grad():
-             current_state = dynamics_map_fn(current_state_detached)
+             current_state = dynamics_map_fn(current_state.detach()) # Use detached state
+             if not torch.all(torch.isfinite(current_state)):
+                  print("Error: Non-finite state encountered during LE state update. Aborting LE estimation.")
+                  return None
 
 
     # Average the log stretch factors
-    lambda_max_estimate = log_stretch_sum / (steps * n_vectors) # Avg over steps and vectors
-    # Note: Theory often divides by steps only. Dividing by n_vectors gives average rate across tracked dimensions.
-    # For *largest* LE, focus on the first diagonal element r_prime[0,0] might be better,
-    # but averaging is simpler/more stable initially. Let's stick to avg for MVP.
-    # lambda_max_estimate = log_stretch_sum / steps # Alternative based on sum log |r_ii|
+    # lambda_max_estimate = log_stretch_sum / (steps * n_vectors) # Avg over steps and vectors
+    # A common definition focuses on the sum of logs, representing the expansion rate.
+    # Dividing by steps gives the average rate.
+    # Focusing only on the first vector's stretch (r_prime[0,0]) approximates the *largest* LE.
+    # Let's return the average log sum per step.
+    lambda_max_estimate = log_stretch_sum / steps
 
     return lambda_max_estimate.item()
 
@@ -188,29 +240,50 @@ def sparsify_vector(vector, k_fraction):
         return torch.zeros_like(vector)
 
     D = vector.numel()
+    if D == 0: return vector # Handle empty vector case
     k_count = max(1, int(D * k_fraction)) # Ensure at least 1 element is kept
 
     # Find the threshold value for the top-k elements
     abs_vector = torch.abs(vector)
-    threshold = torch.kthvalue(abs_vector, D - k_count + 1).values # Find (D-k+1)th smallest abs value = kth largest
+    # Handle potential NaNs or Infs - replace them with 0 for threshold calculation
+    valid_abs_vector = torch.nan_to_num(abs_vector, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Ensure k_count is not larger than the number of elements
+    k_count = min(k_count, D)
+
+    # Use topk directly which is more robust than kthvalue for finding threshold
+    try:
+        threshold = torch.topk(valid_abs_vector, k_count).values[-1] # Value of the k-th largest element
+    except RuntimeError as e:
+         # This can happen if k_count > number of non-zero elements, etc.
+         print(f"Warning: Error in topk during sparsify ({e}). Keeping all elements.")
+         return vector # Fallback: return original vector
+
 
     # Create a mask where abs(vector) >= threshold
-    # Need careful handling if multiple elements have the exact threshold value
-    mask = abs_vector >= threshold
+    mask = valid_abs_vector >= threshold
 
-    # If too many elements are selected due to ties, keep only k_count randomly or by magnitude
+    # If too many elements are selected due to ties (or threshold is 0), keep only k_count
     if mask.sum() > k_count:
          # Get indices of all elements >= threshold
         potential_indices = torch.where(mask)[0]
-        # Get their values
-        potential_values = vector[potential_indices]
-        # Sort by magnitude and take top k_count
-        _, top_indices_relative = torch.topk(torch.abs(potential_values), k_count)
+        # Get their absolute values
+        potential_abs_values = valid_abs_vector[potential_indices]
+        # Sort by magnitude and take top k_count indices relative to potential_indices
+        _, top_indices_relative = torch.topk(potential_abs_values, k_count)
         # Get the actual indices in the original vector
         final_indices = potential_indices[top_indices_relative]
         # Create new mask
-        mask = torch.zeros_like(vector, dtype=torch.bool)
+        mask = torch.zeros_like(vector, dtype=torch.bool, device=vector.device)
         mask[final_indices] = True
+    elif mask.sum() == 0 and k_count > 0 and D > 0:
+         # Handle case where threshold is 0 and all values are 0, but k_count > 0
+         # Or if all values are NaN/Inf and valid_abs_vector is all 0
+         # Keep the top k largest magnitude original values (even if 0)
+         _, top_indices = torch.topk(valid_abs_vector, k_count)
+         mask = torch.zeros_like(vector, dtype=torch.bool, device=vector.device)
+         mask[top_indices] = True
+
 
     # Apply mask
     sparse_vec = torch.zeros_like(vector)
@@ -222,46 +295,31 @@ def sparsify_tensor_batch(tensor_batch, k_fraction):
     """Applies sparsify_vector to each tensor in a batch."""
     return torch.stack([sparsify_vector(t, k_fraction) for t in tensor_batch])
 
-# --- PyTorch Sparse Utilities ---
-# Note: PyTorch sparse support is evolving. These might need adjustments.
-
+# --- PyTorch Sparse Utilities (Placeholders - not strictly needed for MVP) ---
 def sparse_dense_matmul(sparse_matrix, dense_matrix):
-    """Perform SpMM: sparse_matrix @ dense_matrix."""
     return torch.sparse.mm(sparse_matrix, dense_matrix)
 
 def dense_sparse_matmul(dense_matrix, sparse_matrix):
-    """Perform DSM: dense_matrix @ sparse_matrix. Requires transpose tricks."""
-    # (A @ B^T)^T = B @ A^T
-    # Result = (sparse_matrix.T @ dense_matrix.T).T
-    # Note: Transposing sparse matrices can be inefficient depending on format.
-    # Check PyTorch version for optimal way.
-    # For COO: sparse_matrix.t() works.
     return torch.sparse.mm(sparse_matrix.t(), dense_matrix.t()).t()
 
-
 def sparse_elementwise_add(sparse_tensor1, sparse_tensor2):
-    """Adds two sparse tensors. Assumes they have the same shape and sparsity pattern ideally."""
-    # Simple addition often works if indices match or are combined.
-    # PyTorch might automatically handle combining indices.
-    return sparse_tensor1 + sparse_tensor2
+    return (sparse_tensor1 + sparse_tensor2).coalesce()
 
 def sparse_elementwise_mul(sparse_tensor1, sparse_tensor2):
-     """Element-wise multiply for sparse tensors. Result is sparse."""
-     return sparse_tensor1 * sparse_tensor2 # Check if this preserves sparsity as intended
-
+     # Element-wise multiply for sparse tensors. Result is sparse.
+     # Only non-zero where *both* are non-zero.
+     return (sparse_tensor1 * sparse_tensor2).coalesce()
 
 def add_sparse_to_dense(dense_tensor, sparse_tensor):
-    """Adds a sparse tensor to a dense tensor."""
-    return dense_tensor + sparse_tensor.to_dense() # Simplest way, might lose efficiency
+    if sparse_tensor._nnz() == 0:
+        return dense_tensor
+    return dense_tensor + sparse_tensor.to_dense() # Simplest way
 
 def get_sparse_tensor_size(sparse_tensor):
-     """Returns the size of the sparse tensor."""
      return sparse_tensor.size()
 
 def get_sparse_values(sparse_tensor):
-     """Returns the non-zero values of the sparse tensor."""
      return sparse_tensor.values()
 
 def get_sparse_indices(sparse_tensor):
-    """Returns the indices of the non-zero values."""
     return sparse_tensor.indices()

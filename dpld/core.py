@@ -2,175 +2,198 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal, Categorical # Or others if needed
+from torch.distributions import Normal
+import numpy as np
+import math # For checking nan/inf
 
-from utils import estimate_lyapunov_exponent, sparsify_vector # Add sparse utils if needed
+from utils import estimate_lyapunov_exponent, sparsify_vector
 
 # --- Constants ---
-EPSILON = 1e-8 # For numerical stability (e.g., log probabilities)
+EPSILON = 1e-8 # For numerical stability
+DEFAULT_ACTION_STD = 0.05 # Reduced default action noise
+CLS_NORM_CLIP_VAL = 100.0 # Value for optional CLS norm clipping
+MODULE_OUTPUT_CLIP_VAL = 100.0 # Clip raw module predictions
+ACTION_MEAN_CLIP_VAL = 1000.0 # Clip the mean of the write action distribution
+
 
 # --- Predictive Module ---
 class PredictiveModule(nn.Module):
     """
     Implements a DPLD module: Read, Predict, Write (via sparse, gated contribution).
     Learns via difference reward based on global surprise.
+    Includes stability clamping.
     """
     def __init__(self, cls_dim, module_hidden_dim, k_sparse_write, learning_rate,
-                 surprise_scale_factor=1.0, surprise_baseline_ema=0.99, device='cpu'):
+                 surprise_scale_factor=1.0, surprise_baseline_ema=0.99,
+                 action_std=DEFAULT_ACTION_STD, device='cpu'): # Added action_std parameter
         super().__init__()
         self.cls_dim = cls_dim
-        self.k_sparse_write = k_sparse_write # Sparsity fraction k (Part II, Alg 1)
+        self.k_sparse_write = k_sparse_write
         self.device = device
-        self.surprise_scale_factor = surprise_scale_factor # βα in Part II, Alg 1, Eq 4
-        self.surprise_baseline_ema = surprise_baseline_ema # For Sm baseline in Alg 1
+        self.surprise_scale_factor = surprise_scale_factor
+        self.surprise_baseline_ema = surprise_baseline_ema
+        self.action_std = action_std # Store action noise level
 
-        # Internal Predictive Model (fm in Part II, Sec 4.1) - Simple MLP
+        # Internal Predictive Model (fm)
         self.fm = nn.Sequential(
             nn.Linear(cls_dim, module_hidden_dim),
             nn.ReLU(),
             nn.Linear(module_hidden_dim, module_hidden_dim),
             nn.ReLU(),
-             # Output layer predicts the *entire* next CLS state for MVP simplicity
             nn.Linear(module_hidden_dim, cls_dim)
         ).to(device)
-        # Parameters θm are implicitly self.fm.parameters()
 
-        # Gating Query Vector (qm in Part II, Alg 1)
-        self.qm = nn.Parameter(torch.randn(cls_dim, device=device) * 0.1)
+        # Gating Query Vector (qm)
+        self.qm = nn.Parameter(torch.randn(cls_dim, device=device) * 0.01) # Reduced initial scale
 
-        # Store running average of surprise Sm (Sm_bar in Alg 1 logic)
-        self.register_buffer('sm_baseline', torch.tensor(1.0, device=device)) # Initialize baseline reasonably
+        self.register_buffer('sm_baseline', torch.tensor(1.0, device=device))
+        self.last_prediction_ct_plus_1 = None
+        self.last_surprise_sm = None
+        self.last_log_prob = None
 
-        # Store last prediction, surprise, and write vector for learning
-        self.last_prediction_ct_plus_1 = None # ĉm,t+1
-        self.last_surprise_sm = None          # Sm
-        self.last_write_vector_im = None      # Im
-        self.last_log_prob = None             # Log prob of action (write vector) for REINFORCE
-
-        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        # Combine parameters for optimizer
+        self.optimizer = optim.Adam(list(self.fm.parameters()) + [self.qm], lr=learning_rate)
 
 
     def predict(self, ct):
-        """Predicts the next CLS state based on the current state ct."""
-        # ct is expected to be a sparse tensor, convert to dense for MLP
+        """Predicts the next CLS state, clamping the output."""
         ct_dense = ct.to_dense() if ct.is_sparse else ct
-        self.last_prediction_ct_plus_1 = self.fm(ct_dense) # ĉm,t+1
+        prediction = self.fm(ct_dense.detach())
+        # --- Stability: Clip module output ---
+        prediction = torch.clamp(prediction, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
+        self.last_prediction_ct_plus_1 = prediction
         return self.last_prediction_ct_plus_1
 
     def calculate_surprise(self, actual_ct_plus_1):
         """Calculates local surprise Sm based on prediction and actual next state."""
-        # Ensure actual_ct_plus_1 is dense for loss calculation
         actual_ct_plus_1_dense = actual_ct_plus_1.to_dense() if actual_ct_plus_1.is_sparse else actual_ct_plus_1
 
         if self.last_prediction_ct_plus_1 is None:
-             raise RuntimeError("Must call predict() before calculate_surprise()")
+             print("Warning: calculate_surprise called before predict. Returning baseline surprise.")
+             return self.sm_baseline.detach()
 
-        # Using Mean Squared Error as the distance metric (Eq 2, Part II)
-        # Note: Paper uses Distance(ĉ, Proj(c)). Here Proj is identity for MVP.
-        surprise = F.mse_loss(self.last_prediction_ct_plus_1, actual_ct_plus_1_dense, reduction='mean')
+        # Ensure prediction is finite before loss calculation
+        if not torch.all(torch.isfinite(self.last_prediction_ct_plus_1)):
+            print("Warning: Non-finite prediction encountered in calculate_surprise. Using baseline.")
+            self.last_prediction_ct_plus_1 = torch.zeros_like(self.last_prediction_ct_plus_1) # Reset prediction
+            surprise = self.sm_baseline.detach() * 10 # Penalize? Or just use baseline?
+        else:
+            surprise = F.mse_loss(self.last_prediction_ct_plus_1, actual_ct_plus_1_dense.detach(), reduction='mean')
 
-        self.last_surprise_sm = surprise
-
-        # Update baseline Sm (Sm_bar) using EMA
-        self.sm_baseline = self.surprise_baseline_ema * self.sm_baseline + \
-                           (1 - self.surprise_baseline_ema) * surprise.detach()
+        # Ensure surprise is finite before updating baseline
+        if not math.isfinite(surprise.item()):
+            print(f"Warning: Non-finite surprise calculated ({surprise.item()}). Skipping baseline update.")
+            # Use detached baseline as the current surprise to avoid propagating NaN/inf
+            self.last_surprise_sm = self.sm_baseline.detach()
+        else:
+            self.last_surprise_sm = surprise
+            with torch.no_grad():
+                self.sm_baseline = self.surprise_baseline_ema * self.sm_baseline + \
+                                   (1 - self.surprise_baseline_ema) * self.last_surprise_sm
+                self.sm_baseline = torch.clamp(self.sm_baseline, min=1e-6, max=1e6)
 
         return self.last_surprise_sm
 
     def generate_write_vector(self, ct):
-        """Generates the sparse, weighted, gated write vector Im (Alg 1, Part II)."""
-        if self.last_prediction_ct_plus_1 is None or self.last_surprise_sm is None:
-             raise RuntimeError("Must call predict() and calculate_surprise() before generate_write_vector()")
+        """Generates the sparse, weighted, gated write vector Im, with stability checks."""
+        if self.last_prediction_ct_plus_1 is None:
+             raise RuntimeError("Must call predict() before generate_write_vector()")
 
-        # Alg 1, Step 1: Project module output (vm = ĉm,t+1 in MVP)
-        # Wm is identity here, so vm = self.last_prediction_ct_plus_1
-        vm = self.last_prediction_ct_plus_1 # Raw output vector
+        current_surprise_for_alpha = self.sm_baseline.detach()
 
-        # Alg 1, Step 2: Compute raw gating score (sm = qm^T * ct)
+        # Alg 1 Steps 1-5: Calculate intermediate dense write vector
+        vm = self.last_prediction_ct_plus_1 # Already clamped in predict()
         ct_dense = ct.to_dense() if ct.is_sparse else ct
-        raw_gate_score = torch.dot(self.qm, ct_dense) # sm (scalar score for simplicity)
-        # Alternative: element-wise gating gm = sigmoid(qm * ct / tau_g)? Paper implies vector gm.
-        # Let's try element-wise gating for more expressivity.
-        # raw_gate_score_vec = self.qm * ct_dense # Element-wise product
-
-        # Alg 1, Step 3: Compute element-wise gate activation (gm = sigmoid(sm/τg))
-        # Using vector version: gm = sigmoid(qm * ct / tau_g)
-        tau_g = 1.0 # Gating temperature, hyperparameter
-        gate_activation_gm = torch.sigmoid(self.qm * ct_dense / tau_g) # gm (vector [0,1]^D)
-
-        # Alg 1, Step 4: Modulate influence by surprise (αm = α_base + α_scale * tanh(βα(Sm - Sm_bar)))
-        alpha_base = 1.0 # Base influence
-        alpha_scale = 1.0 # Scaling factor for surprise modulation
-        # surprise_scale_factor is βα
-        surprise_diff = self.last_surprise_sm - self.sm_baseline
+        tau_g = 1.0
+        gate_activation_gm = torch.sigmoid(self.qm * ct_dense.detach() / tau_g)
+        alpha_base = 1.0
+        alpha_scale = 1.0
+        surprise_diff = current_surprise_for_alpha - self.sm_baseline
         influence_scalar_am = alpha_base + alpha_scale * torch.tanh(self.surprise_scale_factor * surprise_diff)
-        influence_scalar_am = torch.clamp(influence_scalar_am, min=0.1) # Ensure non-negative influence
+        influence_scalar_am = torch.clamp(influence_scalar_am, min=0.1, max=10.0)
+        intermediate_write_vector = influence_scalar_am * (gate_activation_gm * vm)
 
-        # Alg 1, Step 5: Apply gating and scaling (Im_dense = αm * (gm ⊙ vm))
-        # Using Hadamard product (element-wise)
-        intermediate_write_vector = influence_scalar_am * (gate_activation_gm * vm) # Dense intermediate Im
-
-        # --- Stochasticity for REINFORCE ---
-        # Option 1: Add noise to vm before gating/scaling (simple)
-        # Option 2: Output parameters of a distribution from fm, sample vm
-        # Option 3: Make sparse index selection stochastic (complex)
-        # Let's use Option 1 for MVP: treat the deterministic intermediate_write_vector
-        # as the mean of a Normal distribution, sample from it, then sparsify.
-        # This action allows gradient flow via REINFORCE.
+        # --- Stochasticity & Stability ---
         action_mean = intermediate_write_vector
-        action_std = 0.1 # Fixed std deviation for simplicity, could be learned/scheduled
-        dist = Normal(action_mean, action_std)
-        # Sample the action (dense vector before sparsification)
-        dense_write_vector_sampled = dist.sample()
-        self.last_log_prob = dist.log_prob(dense_write_vector_sampled).sum() # Sum log prob over dimensions
 
-        # Alg 1, Step 6 & 7: Sparsify the contribution vector
-        self.last_write_vector_im = sparsify_vector(dense_write_vector_sampled, self.k_sparse_write)
+        # --- Stability: Check and clamp action_mean before Normal distribution ---
+        if not torch.all(torch.isfinite(action_mean)):
+            print(f"Warning: NaN/inf detected in action_mean for module. Clamping.")
+            action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=ACTION_MEAN_CLIP_VAL, neginf=-ACTION_MEAN_CLIP_VAL)
+        action_mean = torch.clamp(action_mean, -ACTION_MEAN_CLIP_VAL, ACTION_MEAN_CLIP_VAL)
 
-        # Convert to sparse tensor format for efficiency
-        sparse_indices = torch.where(self.last_write_vector_im != 0)[0].unsqueeze(0)
-        sparse_values = self.last_write_vector_im[sparse_indices.squeeze(0)]
+        action_std_tensor = torch.full_like(action_mean, fill_value=self.action_std)
+
+        # Create distribution and sample
+        try:
+            dist = Normal(action_mean, action_std_tensor)
+            dense_write_vector_sampled = dist.sample()
+            # Calculate log_prob using detached sample
+            self.last_log_prob = dist.log_prob(dense_write_vector_sampled.detach()).sum()
+        except ValueError as e:
+             print(f"ERROR creating Normal distribution: {e}")
+             print(f"action_mean stats: min={action_mean.min()}, max={action_mean.max()}, has_nan={torch.isnan(action_mean).any()}")
+             print(f"action_std_tensor stats: min={action_std_tensor.min()}, max={action_std_tensor.max()}, has_nan={torch.isnan(action_std_tensor).any()}")
+             # Fallback: return zero vector and zero log_prob
+             dense_write_vector_sampled = torch.zeros_like(action_mean)
+             self.last_log_prob = torch.tensor(0.0, device=self.device) # Zero log prob for safety
+
+
+        # Alg 1 Steps 6-7: Sparsify
+        write_vector_im_sparse_vals = sparsify_vector(dense_write_vector_sampled, self.k_sparse_write)
+        sparse_indices = torch.where(write_vector_im_sparse_vals != 0)[0].unsqueeze(0)
+        sparse_values = write_vector_im_sparse_vals[sparse_indices.squeeze(0)]
 
         if sparse_indices.numel() > 0:
              im_sparse = torch.sparse_coo_tensor(sparse_indices, sparse_values, (self.cls_dim,), device=self.device)
         else:
-             # Handle case where vector becomes all zero after sparsification
-             im_sparse = torch.sparse_coo_tensor((1, 0), [], (self.cls_dim,), device=self.device)
+             im_sparse = torch.sparse_coo_tensor(torch.empty((1, 0), dtype=torch.long, device=self.device),
+                                                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                                                 (self.cls_dim,))
 
-
-        return im_sparse
+        return im_sparse.coalesce()
 
     def learn(self, difference_reward_rm):
         """Updates module parameters using the difference reward."""
-        if self.last_log_prob is None:
-             print("Warning: learn() called before generate_write_vector() produced log_prob. Skipping update.")
-             return torch.tensor(0.0) # Return zero loss
+        if self.last_log_prob is None or self.last_log_prob == 0.0: # Check for fallback case
+             return 0.0
 
-        # REINFORCE update rule: loss = - R * log_prob (gradient ascent maximizes R * log_prob)
-        # We minimize the negative, hence - R * log_prob
-        # R is the difference reward Rm (Prop 4.2, Eq 4, Part II)
-        loss = -difference_reward_rm * self.last_log_prob
+        # Ensure reward is finite, otherwise skip update
+        if not math.isfinite(difference_reward_rm):
+             print(f"Warning: Non-finite difference reward ({difference_reward_rm}). Skipping module learn step.")
+             self.last_log_prob = None
+             return 0.0
+
+        # Use .clone().detach() to avoid the UserWarning if difference_reward_rm is already a tensor
+        reward_tensor = difference_reward_rm.clone().detach() if isinstance(difference_reward_rm, torch.Tensor) else torch.tensor(difference_reward_rm, device=self.device)
+
+        loss = -reward_tensor * self.last_log_prob
+
+        # --- Stability: Check loss before backward ---
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss ({loss.item()}) calculated in module learn. Skipping backward pass.")
+            self.last_log_prob = None
+            return 0.0
 
         self.optimizer.zero_grad()
         loss.backward()
-        # Optional: Gradient clipping
-        # nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        # --- Stability: Gradient clipping ---
+        nn.utils.clip_grad_norm_(list(self.fm.parameters()) + [self.qm], max_norm=1.0)
         self.optimizer.step()
 
-        # Clear stored values
-        self.last_prediction_ct_plus_1 = None
-        self.last_surprise_sm = None
-        self.last_write_vector_im = None
         self.last_log_prob = None
+        self.last_prediction_ct_plus_1 = None
 
         return loss.item()
 
 
 # --- Meta-Model ---
+# (No changes needed from previous version, but ensure gamma range in train.py is updated)
 class MetaModel(nn.Module):
     """
     Implements a simplified DPLD Meta-Model for stability regulation.
     Monitors CLS dynamics (lambda_max) and adjusts global decay (gamma_t).
+    NOTE: Learning mechanism is disabled in this MVP version.
     """
     def __init__(self, cls_dim, meta_hidden_dim, learning_rate,
                  gamma_min=0.01, gamma_max=0.2, stability_target=0.1, device='cpu'):
@@ -181,83 +204,62 @@ class MetaModel(nn.Module):
         self.gamma_max = gamma_max
         self.stability_target = stability_target # lambda_thr in Thm 7.1
 
-        # Model to process CLS history and predict stability / control params
-        # Input: Concatenated recent CLS states (e.g., ct, ct-1) -> 2 * cls_dim
-        # For MVP, let's just use the current state ct to decide gamma
-        # A more complex version would use an RNN or look at lambda_max history
+        # Controller network (currently unused for learning)
         self.controller = nn.Sequential(
-             # Input size needs adjustment if using history
             nn.Linear(cls_dim, meta_hidden_dim),
             nn.ReLU(),
             nn.Linear(meta_hidden_dim, 1) # Output: single value controlling gamma
         ).to(device)
         # Parameters θMM are implicitly self.controller.parameters()
 
-        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        self.last_lambda_max = None
+        # Optimizer (currently unused)
+        # self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+
+        # Store the last estimated lambda_max
+        self.last_estimated_lambda_max = None
 
 
-    def estimate_stability(self, cls_dynamics_map_fn, current_ct):
-        """Estimates lambda_max using external utility function."""
-        # cls_dynamics_map_fn: function(ct) -> ct+1
-        # Needs the *full* DPLD one-step dynamics function
-        self.last_lambda_max = estimate_lyapunov_exponent(
-            cls_dynamics_map_fn,
-            current_ct.detach().to_dense(), # Needs dense state for JVP
-            n_vectors=5, # Hyperparameter
-            steps=20,    # Hyperparameter (lower for speed in training loop)
-            device=self.device
-        )
-        return self.last_lambda_max
+    def update_stability_estimate(self, lambda_max_estimate):
+        """Stores the latest LE estimate."""
+        self.last_estimated_lambda_max = lambda_max_estimate
 
     def compute_regulation(self, current_ct):
-        """Computes adaptive decay gamma_t and modulatory vector mmod_t."""
-        ct_dense = current_ct.to_dense() if current_ct.is_sparse else current_ct
-
+        """
+        Computes adaptive decay gamma_t based on the last LE estimate.
+        Computes modulatory vector mmod_t (zero for MVP).
+        """
         # --- Adaptive Decay γt ---
-        # Simple strategy: If lambda_max > target, increase decay, else decrease.
-        # Use the controller network to map state to a gamma value.
-        # Alternative: Directly use estimated lambda_max
-        if self.last_lambda_max is not None:
+        # Use the last estimated lambda_max (potentially from a previous step)
+        if self.last_estimated_lambda_max is not None and np.isfinite(self.last_estimated_lambda_max):
              # Sigmoid mapping from lambda_max to gamma range
-             # Higher lambda_max -> higher gamma (closer to gamma_max)
-             gamma_signal = torch.sigmoid(torch.tensor(self.last_lambda_max - self.stability_target, device=self.device)) # Shifted sigmoid
+             # Increase sensitivity: scale difference before sigmoid
+             sensitivity = 5.0
+             gamma_signal = torch.sigmoid(torch.tensor(sensitivity * (self.last_estimated_lambda_max - self.stability_target), device=self.device))
              gamma_t = self.gamma_min + (self.gamma_max - self.gamma_min) * gamma_signal
+             gamma_t = torch.clamp(gamma_t, self.gamma_min, self.gamma_max) # Ensure bounds
+             gamma_t = gamma_t.item() # Convert to scalar float
         else:
-             # Default gamma if stability not estimated yet
-             gamma_t = (self.gamma_min + self.gamma_max) / 2.0
+             # Default gamma if stability not estimated yet or estimate was invalid
+             # Start with a higher default gamma for stability
+             gamma_t = self.gamma_max # (self.gamma_min + self.gamma_max) / 2.0
 
         # --- Modulatory Vector mmod_t ---
-        # Set to zero for MVP
-        mmod_t = torch.sparse_coo_tensor((1, 0), [], (self.cls_dim,), device=self.device)
+        # Set to zero sparse tensor for MVP
+        mmod_t = torch.sparse_coo_tensor(torch.empty((1, 0), dtype=torch.long, device=self.device),
+                                         torch.empty((0,), dtype=torch.float32, device=self.device),
+                                         (self.cls_dim,))
 
-        return gamma_t.item(), mmod_t # Return gamma as scalar, mmod as sparse tensor
+        return gamma_t, mmod_t
 
 
     def learn(self):
-        """Updates Meta-Model parameters based on stability objective."""
-        if self.last_lambda_max is None:
+        """Updates Meta-Model parameters (DISABLED in MVP)."""
+        if self.last_estimated_lambda_max is None or not np.isfinite(self.last_estimated_lambda_max):
             return 0.0 # Cannot learn without stability estimate
 
-        # Objective LMM: Minimize instability penalty (Eq 5, Part II, simplified)
-        # Penalize lambda_max exceeding the target threshold
-        instability_penalty = F.relu(torch.tensor(self.last_lambda_max - self.stability_target, device=self.device))
+        instability_penalty = F.relu(torch.tensor(self.last_estimated_lambda_max - self.stability_target, device=self.device))
         loss = instability_penalty # Simple ReLU penalty
 
-        # Note: For the controller network to learn, the loss needs to depend
-        # on its parameters. Here, gamma_t calculation depends on lambda_max,
-        # which depends on the system dynamics influenced by gamma_t from the
-        # *previous* step (or controller output if it directly output gamma).
-        # This credit assignment is tricky.
-        # MVP Simplification: Don't train the controller network yet.
-        # Just use the rule-based gamma adaptation based on lambda_max.
-        # We can add learning later if needed.
-        # If we were training the controller:
-        # self.optimizer.zero_grad()
-        # loss.backward() # Requires gradient path from lambda_max back to controller params - complex!
-        # self.optimizer.step()
-
-        self.last_lambda_max = None # Reset after use
         return loss.item()
 
 
@@ -265,23 +267,29 @@ class MetaModel(nn.Module):
 class DPLDSystem(nn.Module):
     """
     The main DPLD system coordinating CLS, Modules, and Meta-Model.
+    Includes optional CLS norm clipping.
     """
     def __init__(self, cls_dim, num_modules, module_hidden_dim, meta_hidden_dim,
                  k_sparse_write, module_lr, meta_lr, noise_std_dev_schedule,
-                 gamma_min=0.01, gamma_max=0.2, stability_target=0.1, device='cpu'):
+                 gamma_min=0.01, gamma_max=0.2, stability_target=0.1,
+                 action_std=DEFAULT_ACTION_STD, # Pass down action_std
+                 clip_cls_norm=True, # Add option to clip CLS norm
+                 device='cpu'):
         super().__init__()
         self.cls_dim = cls_dim
         self.num_modules = num_modules
         self.k_sparse_write = k_sparse_write
-        self.noise_std_dev_schedule = noise_std_dev_schedule # Function step -> std_dev
+        self.noise_std_dev_schedule = noise_std_dev_schedule
+        self.clip_cls_norm = clip_cls_norm
         self.device = device
 
         # Initialize CLS state (sparse tensor)
         self.ct = self._init_cls()
 
         # Initialize Modules
-        self.modules = nn.ModuleList([
-            PredictiveModule(cls_dim, module_hidden_dim, k_sparse_write, module_lr, device=device)
+        self.pred_modules = nn.ModuleList([
+            PredictiveModule(cls_dim, module_hidden_dim, k_sparse_write, module_lr,
+                             action_std=action_std, device=device) # Pass action_std
             for _ in range(num_modules)
         ])
 
@@ -289,134 +297,148 @@ class DPLDSystem(nn.Module):
         self.meta_model = MetaModel(cls_dim, meta_hidden_dim, meta_lr,
                                     gamma_min, gamma_max, stability_target, device=device)
 
-        # Buffer for difference reward calculation
-        self.last_gt = None
+        self.last_global_surprise_gt = None
 
     def _init_cls(self):
-        # Start with a zero or small random sparse vector
-        # return torch.sparse_coo_tensor((self.cls_dim,), device=self.device)
-        initial_dense = torch.randn(self.cls_dim, device=self.device) * 0.1
-        sparse_ct = sparsify_vector(initial_dense, 0.1).to_sparse_coo() # Start sparse
-        return sparse_ct
+        # Start with smaller magnitude
+        initial_dense = torch.randn(self.cls_dim, device=self.device) * 0.01
+        # Ensure initial state is actually sparse
+        sparse_ct = sparsify_vector(initial_dense, self.k_sparse_write).to_sparse_coo()
+        return sparse_ct.coalesce()
 
 
     def cls_update_rule(self, ct, sum_im, mmodt, gamma_t, noise_std_dev):
-        """Implements the CLS update equation (Eq 1, Part II)."""
-        # Decay term: (1 - gamma_t) * ct
+        """Implements the CLS update equation with optional norm clipping."""
+        if not ct.is_sparse: ct = ct.to_sparse_coo()
+        if not sum_im.is_sparse: sum_im = sum_im.to_sparse_coo()
+        if not mmodt.is_sparse: mmodt = mmodt.to_sparse_coo()
+
         decayed_ct = (1.0 - gamma_t) * ct
-
-        # Noise term: epsilon_t ~ N(0, sigma_t^2 * I)
-        # Generate sparse noise? Or add dense noise then potentially sparsify?
-        # Adding dense noise is simpler.
         noise_et = torch.randn(self.cls_dim, device=self.device) * noise_std_dev
-        noise_et_sparse = noise_et.to_sparse_coo() # Convert to sparse if needed
 
-        # Combine terms: ct+1 = (1-gamma)ct + Sum(Im) + mmod_t + eps_t
-        # Sparse additions
-        ct_plus_1 = decayed_ct + sum_im + mmodt + noise_et_sparse
+        # Combine sparse terms first
+        ct_plus_1_sparse = (decayed_ct + sum_im + mmodt).coalesce()
 
-        # Optional: Explicit normalization (Lemma 3.1 discussion)
-        # norm = torch.linalg.norm(ct_plus_1.to_dense()) # Requires densification
-        # max_norm = 10.0
-        # if norm > max_norm:
-        #     ct_plus_1 = (ct_plus_1 / norm) * max_norm
+        # Add dense noise
+        ct_plus_1_dense = ct_plus_1_sparse.to_dense() + noise_et
 
-        # Ensure result is sparse (additions might densify if indices overlap heavily)
-        # Coalesce sums sparse tensors
-        ct_plus_1 = ct_plus_1.coalesce()
+        # --- Stability: Optional CLS norm clipping ---
+        if self.clip_cls_norm:
+            norm = torch.linalg.norm(ct_plus_1_dense)
+            if norm > CLS_NORM_CLIP_VAL:
+                 # print(f"Clipping CLS norm: {norm:.2f} -> {CLS_NORM_CLIP_VAL}") # Debug
+                 ct_plus_1_dense = ct_plus_1_dense * (CLS_NORM_CLIP_VAL / (norm + EPSILON))
 
-        # Optional: Re-sparsify if density increases too much
-        # current_density = ct_plus_1.values().numel() / self.cls_dim
-        # target_density = self.k_sparse_write * self.num_modules # Rough target
-        # if current_density > target_density * 1.5:
-        #     ct_plus_1 = sparsify_vector(ct_plus_1.to_dense(), target_density).to_sparse_coo()
+        # Convert back to sparse - Note: density might still be high due to noise
+        # Consider re-sparsifying here if strict density is needed, but adds complexity.
+        ct_plus_1 = ct_plus_1_dense.to_sparse_coo()
+
+        return ct_plus_1.coalesce()
 
 
-        return ct_plus_1
+    def get_dynamics_map(self, fixed_gamma, fixed_noise_std=0.0):
+         """
+         Returns a function representing the one-step CLS dynamics for LE estimation.
+         Uses current module parameters but *fixed* gamma and noise for consistency.
+         Includes stability clamping within the map definition.
+         """
+         gamma_val = float(fixed_gamma)
 
+         def dynamics_map(state_t_dense):
+             # Ensure input state is finite for JVP
+             if not torch.all(torch.isfinite(state_t_dense)):
+                 print("Error: Non-finite input state to dynamics_map for LE.")
+                 # Return a zero tensor or raise error? Returning zero might hide issues.
+                 # Let's return the input, LE estimator might handle it.
+                 return state_t_dense
 
-    def get_dynamics_map(self):
-         """Returns a function representing the one-step CLS dynamics for Lyapunov estimation."""
-         # This function needs access to the current state of modules (for Im) and meta-model (for gamma, mmod)
-         # It's tricky because these change during training.
-         # For estimation, we might need to freeze parameters temporarily or use current ones.
+             state_t_sparse = state_t_dense.to_sparse_coo()
+             sum_im = self._init_cls()
 
-         def dynamics_map(state_t):
-             # state_t is assumed dense for JVP calculation
-             state_t_sparse = state_t.to_sparse_coo()
+             with torch.no_grad():
+                 for i, module in enumerate(self.pred_modules):
+                     # --- Replicate prediction and deterministic write vector generation ---
+                     # Predict & Clamp
+                     pred = module.fm(state_t_sparse.to_dense().detach())
+                     pred = torch.clamp(pred, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
 
-             # 1. Get module write vectors Im based on state_t
-             sum_im = self._init_cls() # Zero sparse tensor
-             with torch.no_grad(): # Don't track gradients through this estimation path
-                 for module in self.modules:
-                     # Need predict, calc_surprise (dummy here?), generate_write
-                     # This is problematic as surprise depends on ct+1.
-                     # Approximation: Use current baseline surprise for influence alpha_m?
-                     pred = module.predict(state_t_sparse) # Use state_t
-                     # Use baseline surprise for alpha_m calculation in generate_write
-                     module.last_prediction_ct_plus_1 = pred
-                     module.last_surprise_sm = module.sm_baseline # Use baseline
-                     im = module.generate_write_vector(state_t_sparse)
+                     # Use baseline surprise for alpha_m
+                     current_surprise_for_alpha = module.sm_baseline.detach()
+
+                     # Calculate deterministic intermediate write vector
+                     vm = pred # Use clamped prediction
+                     ct_dense_detached = state_t_sparse.to_dense().detach()
+                     tau_g = 1.0
+                     gate_activation_gm = torch.sigmoid(module.qm.detach() * ct_dense_detached / tau_g)
+                     alpha_base = 1.0; alpha_scale = 1.0
+                     surprise_diff = current_surprise_for_alpha - module.sm_baseline.detach()
+                     influence_scalar_am = alpha_base + alpha_scale * torch.tanh(module.surprise_scale_factor * surprise_diff)
+                     influence_scalar_am = torch.clamp(influence_scalar_am, min=0.1, max=10.0)
+                     intermediate_write_vector = influence_scalar_am * (gate_activation_gm * vm)
+
+                     # Clamp the mean action
+                     intermediate_write_vector = torch.clamp(intermediate_write_vector, -ACTION_MEAN_CLIP_VAL, ACTION_MEAN_CLIP_VAL)
+
+                     # Sparsify the *mean* action
+                     write_vector_im_sparse_vals = sparsify_vector(intermediate_write_vector, module.k_sparse_write)
+                     sparse_indices = torch.where(write_vector_im_sparse_vals != 0)[0].unsqueeze(0)
+                     sparse_values = write_vector_im_sparse_vals[sparse_indices.squeeze(0)]
+                     if sparse_indices.numel() > 0:
+                         im = torch.sparse_coo_tensor(sparse_indices, sparse_values, (self.cls_dim,), device=self.device)
+                     else:
+                         im = torch.sparse_coo_tensor(torch.empty((1, 0), dtype=torch.long, device=self.device),
+                                                      torch.empty((0,), dtype=torch.float32, device=self.device),
+                                                      (self.cls_dim,))
                      sum_im += im
-                     # Reset module state after use
-                     module.last_prediction_ct_plus_1 = None
-                     module.last_surprise_sm = None
-                     module.last_write_vector_im = None
-                     module.last_log_prob = None
+                 # --- End Module Loop ---
+
+                 gamma_t = gamma_val
+                 mmodt = torch.sparse_coo_tensor(torch.empty((1, 0), dtype=torch.long, device=self.device),
+                                                  torch.empty((0,), dtype=torch.float32, device=self.device),
+                                                  (self.cls_dim,))
+
+                 next_state_sparse = self.cls_update_rule(state_t_sparse, sum_im.coalesce(), mmodt, gamma_t, fixed_noise_std)
+                 next_state_dense = next_state_sparse.to_dense()
+
+                 # Ensure output is finite
+                 if not torch.all(torch.isfinite(next_state_dense)):
+                     print("Warning: Non-finite output state from dynamics_map for LE. Clamping.")
+                     next_state_dense = torch.nan_to_num(next_state_dense, nan=0.0, posinf=CLS_NORM_CLIP_VAL, neginf=-CLS_NORM_CLIP_VAL)
 
 
-                 # 2. Get meta-model regulation based on state_t
-                 # Use current lambda_max estimate or a fixed one? Use fixed for map consistency.
-                 # gamma_t, mmodt = self.meta_model.compute_regulation(state_t_sparse) # Uses internal lambda_max
-                 # Use fixed gamma for map definition:
-                 gamma_t = (self.meta_model.gamma_min + self.meta_model.gamma_max) / 2.0
-                 mmodt = torch.sparse_coo_tensor((1, 0), [], (self.cls_dim,), device=self.device)
-
-
-                 # 3. Apply CLS update rule
-                 noise_std_dev = 0.0 # No noise for deterministic map estimation
-                 next_state = self.cls_update_rule(state_t_sparse, sum_im.coalesce(), mmodt, gamma_t, noise_std_dev)
-
-             return next_state.to_dense() # Return dense for JVP
+             return next_state_dense # Return dense for JVP
 
          return dynamics_map
 
 
-    def step(self, current_step_num):
-        """Performs one full step of the DPLD system interaction."""
+    def step(self, current_step_num, estimate_le=False):
+        """Performs one full step of the DPLD system interaction with stability checks."""
+
+        # --- Check current state ---
+        if not torch.all(torch.isfinite(self.ct.values())):
+             print(f"ERROR: CLS state became non-finite at step {current_step_num}. Resetting state.")
+             self.ct = self._init_cls() # Reset CLS
+             self.last_global_surprise_gt = None # Reset GT baseline
+             # Optionally reset module baselines?
+             for module in self.pred_modules:
+                 module.sm_baseline.fill_(1.0)
+
+        ct_prev_dense = self.ct.to_dense().detach()
 
         # --- 1. Module Predictions ---
         predictions = []
-        for module in self.modules:
-            predictions.append(module.predict(self.ct))
+        for module in self.pred_modules:
+            pred = module.predict(self.ct.detach())
+            predictions.append(pred)
 
         # --- 2. Meta-Model Regulation ---
-        # Estimate stability based on current state and dynamics
-        # Need the dynamics map function
-        # dynamics_map_fn = self.get_dynamics_map() # This might be slow if called every step
-        # lambda_max = self.meta_model.estimate_stability(dynamics_map_fn, self.ct)
-        # TEMP: Disable Lyapunov estimation during step for speed in MVP training loop
-        lambda_max = 0.0 # Placeholder
-        self.meta_model.last_lambda_max = lambda_max # Store for logging/gamma calc
-
-        # Compute gamma_t and mmod_t
-        gamma_t, mmod_t = self.meta_model.compute_regulation(self.ct)
+        gamma_t, mmod_t = self.meta_model.compute_regulation(self.ct.detach())
 
         # --- 3. Module Write Vectors ---
-        # Need surprise first, which depends on ct+1. Chicken and egg.
-        # Solution: Calculate surprise *after* ct+1 is computed.
-        # But generate_write_vector needs surprise for alpha_m.
-        # Approximation: Use surprise from *previous* step (or baseline) for alpha_m.
-        # Let's stick to the logic in PredictiveModule which uses current sm_baseline.
-
         write_vectors_im = []
-        sum_im = self._init_cls() # Zero sparse tensor
-        for i, module in enumerate(self.modules):
-             # predict() was already called. Need dummy surprise calculation to proceed.
-             # The real surprise calculation happens after ct+1 is known.
-             module.last_prediction_ct_plus_1 = predictions[i]
-             module.last_surprise_sm = module.sm_baseline # Use baseline for alpha_m
-             im = module.generate_write_vector(self.ct)
+        sum_im = self._init_cls()
+        for i, module in enumerate(self.pred_modules):
+             im = module.generate_write_vector(self.ct.detach())
              write_vectors_im.append(im)
              sum_im += im
         sum_im = sum_im.coalesce()
@@ -427,77 +449,106 @@ class DPLDSystem(nn.Module):
 
         # --- 5. Calculate Actual Surprises & Global Surprise ---
         surprises_sm = []
-        global_surprise_gt = 0.0
-        for i, module in enumerate(self.modules):
-             # Now calculate the actual surprise using ct_plus_1
-             sm = module.calculate_surprise(ct_plus_1) # Updates module.last_surprise_sm correctly now
-             surprises_sm.append(sm)
-             global_surprise_gt += sm
-        global_surprise_gt /= self.num_modules
+        global_surprise_gt_sum = 0.0
+        valid_surprises = 0
+        for i, module in enumerate(self.pred_modules):
+             sm = module.calculate_surprise(ct_plus_1)
+             if math.isfinite(sm.item()):
+                 surprises_sm.append(sm)
+                 global_surprise_gt_sum += sm
+                 valid_surprises += 1
+             else:
+                 surprises_sm.append(torch.tensor(float('nan'), device=self.device)) # Keep placeholder
+
+        global_surprise_gt = (global_surprise_gt_sum / valid_surprises) if valid_surprises > 0 else torch.tensor(0.0, device=self.device)
 
         # --- 6. Calculate Difference Rewards ---
-        # Requires counterfactual Gt^{-m} (Def 4.1, Part II)
         difference_rewards_rm = []
-        if self.last_gt is not None: # Need previous Gt for comparison? No, need counterfactual.
-            # Calculate Gt^{-m} for each module m
-            for m_idx in range(self.num_modules):
-                # Compute sum_im without module m
-                sum_im_counterfactual = self._init_cls()
-                for i in range(self.num_modules):
-                    if i != m_idx:
-                        sum_im_counterfactual += write_vectors_im[i] # Use the already generated Im
-                sum_im_counterfactual = sum_im_counterfactual.coalesce()
+        if self.num_modules > 0 and self.last_global_surprise_gt is not None and math.isfinite(self.last_global_surprise_gt):
+            # Calculate Gt^{-m} only if Gt is valid
+            if math.isfinite(global_surprise_gt.item()):
+                for m_idx in range(self.num_modules):
+                    sum_im_counterfactual = self._init_cls()
+                    for i in range(self.num_modules):
+                        if i != m_idx and write_vectors_im[i].is_sparse:
+                             sum_im_counterfactual += write_vectors_im[i]
+                    sum_im_counterfactual = sum_im_counterfactual.coalesce()
 
-                # Compute ct+1^{-m} using the same noise and gamma
-                ct_plus_1_counterfactual = self.cls_update_rule(
-                    self.ct, sum_im_counterfactual, mmod_t, gamma_t, noise_std_dev
-                )
+                    ct_plus_1_counterfactual = self.cls_update_rule(
+                        self.ct, sum_im_counterfactual, mmod_t, gamma_t, noise_std_dev
+                    )
+                    ct_plus_1_cf_dense = ct_plus_1_counterfactual.to_dense().detach()
 
-                # Compute Gt^{-m} by calculating surprises relative to ct+1^{-m}
-                gt_counterfactual = 0.0
-                for i, module in enumerate(self.modules):
-                    # Surprise if module i's prediction (made based on ct) is compared to ct+1^{-m}
-                    sm_counterfactual = F.mse_loss(predictions[i], ct_plus_1_counterfactual.to_dense(), reduction='mean')
-                    gt_counterfactual += sm_counterfactual
-                gt_counterfactual /= self.num_modules
+                    gt_counterfactual_sum = 0.0
+                    valid_cf_surprises = 0
+                    for i, module in enumerate(self.pred_modules):
+                        if predictions[i] is not None and torch.all(torch.isfinite(predictions[i])):
+                             sm_counterfactual = F.mse_loss(predictions[i].detach(), ct_plus_1_cf_dense, reduction='mean')
+                             if math.isfinite(sm_counterfactual.item()):
+                                 gt_counterfactual_sum += sm_counterfactual
+                                 valid_cf_surprises += 1
+                    gt_counterfactual = (gt_counterfactual_sum / valid_cf_surprises) if valid_cf_surprises > 0 else torch.tensor(0.0, device=self.device)
 
-                # Difference Reward Rm = Gt^{-m} - Gt
-                rm = gt_counterfactual - global_surprise_gt
-                # We want to *minimize* Gt, so reward should be negative of this?
-                # Paper Prop 4.2 uses R = Gt^{-m} - Gt and aims to maximize R via policy gradient.
-                # Gradient is approx E[R * grad(log(pi))]. Minimizing Gt is E[-Gt * grad(log(pi))].
-                # So using R = Gt^{-m} - Gt directly in REINFORCE loss (-R*log_prob) should work.
-                difference_rewards_rm.append(rm.detach()) # Detach reward from graph
-
-        else: # First step, no baseline Gt? Or set R=0?
+                    rm = gt_counterfactual - global_surprise_gt
+                    difference_rewards_rm.append(rm.detach())
+            else: # Gt was not finite
+                 difference_rewards_rm = [torch.tensor(0.0, device=self.device) for _ in range(self.num_modules)]
+        else: # First step or invalid last_gt
             difference_rewards_rm = [torch.tensor(0.0, device=self.device) for _ in range(self.num_modules)]
 
-        # --- 7. Update State and Store ---
+        # --- 7. Update State and Store Previous GT ---
         self.ct = ct_plus_1
-        self.last_gt = global_surprise_gt.detach()
+        self.last_global_surprise_gt = global_surprise_gt.item() if math.isfinite(global_surprise_gt.item()) else None
+
 
         # --- 8. Trigger Learning ---
         module_losses = []
-        for i, module in enumerate(self.modules):
-            loss = module.learn(difference_rewards_rm[i])
+        for i, module in enumerate(self.pred_modules):
+            reward = difference_rewards_rm[i] if i < len(difference_rewards_rm) else 0.0
+            loss = module.learn(reward)
             module_losses.append(loss)
 
-        meta_loss = self.meta_model.learn() # Simplified meta-learning
+        meta_loss = self.meta_model.learn()
 
-        # --- 9. Return Metrics ---
+        # --- 9. Optional: Estimate LE ---
+        lambda_max_estimate = None
+        if estimate_le:
+            # Only estimate if previous state was finite
+            if torch.all(torch.isfinite(ct_prev_dense)):
+                dynamics_map_for_le = self.get_dynamics_map(fixed_gamma=gamma_t)
+                lambda_max_estimate = estimate_lyapunov_exponent(
+                    dynamics_map_for_le,
+                    ct_prev_dense,
+                    device=self.device
+                )
+                if lambda_max_estimate is not None and not math.isfinite(lambda_max_estimate):
+                     print(f"Warning: Non-finite LE estimate ({lambda_max_estimate}). Discarding.")
+                     lambda_max_estimate = None # Discard invalid estimate
+                self.meta_model.update_stability_estimate(lambda_max_estimate)
+            else:
+                print("Skipping LE estimation due to non-finite previous state.")
+
+
+        # --- 10. Return Metrics ---
+        # Calculate metrics safely, handling potential NaNs
+        finite_surprises = [s.item() for s in surprises_sm if s is not None and math.isfinite(s.item())]
+        finite_rewards = [r.item() for r in difference_rewards_rm if r is not None and math.isfinite(r.item())]
+        finite_losses = [l for l in module_losses if l is not None and math.isfinite(l)]
+
         metrics = {
-            "Gt": global_surprise_gt.item(),
-            "Sm_avg": torch.mean(torch.stack(surprises_sm)).item(),
-            "Sm_std": torch.std(torch.stack(surprises_sm)).item() if len(surprises_sm) > 1 else 0.0,
-            "Rm_avg": torch.mean(torch.stack(difference_rewards_rm)).item(),
-            "Rm_std": torch.std(torch.stack(difference_rewards_rm)).item() if len(difference_rewards_rm) > 1 else 0.0,
-            "lambda_max": lambda_max, # Estimated lambda_max
+            "Gt": global_surprise_gt.item() if math.isfinite(global_surprise_gt.item()) else float('nan'),
+            "Sm_avg": np.mean(finite_surprises) if finite_surprises else float('nan'),
+            "Sm_std": np.std(finite_surprises) if len(finite_surprises) > 1 else 0.0,
+            "Rm_avg": np.mean(finite_rewards) if finite_rewards else float('nan'),
+            "Rm_std": np.std(finite_rewards) if len(finite_rewards) > 1 else 0.0,
+            "lambda_max_est": lambda_max_estimate,
             "gamma_t": gamma_t,
             "noise_std": noise_std_dev,
-            "module_loss_avg": np.mean(module_losses) if module_losses else 0.0,
+            "module_loss_avg": np.mean(finite_losses) if finite_losses else float('nan'),
             "meta_loss": meta_loss,
-            "cls_norm": torch.linalg.norm(self.ct.to_dense()).item(),
-             "cls_density": self.ct.values().numel() / self.cls_dim if self.ct.values().numel() > 0 else 0.0
+            "cls_norm": torch.linalg.norm(self.ct.to_dense()).item() if torch.all(torch.isfinite(self.ct.values())) else float('nan'),
+             # Note: cls_density might be high due to dense noise addition
+            "cls_density": self.ct._nnz() / self.cls_dim if self.ct._nnz() is not None else float('nan')
         }
 
         return metrics
