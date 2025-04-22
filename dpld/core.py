@@ -12,11 +12,11 @@ from utils import estimate_lyapunov_exponent, sparsify_vector # Assuming these a
 
 # --- Constants (Revised Action Std, Grad Clip) ---
 EPSILON = 1e-8 # For numerical stability
-DEFAULT_ACTION_STD = 0.1 # Reduced default action std dev
+DEFAULT_ACTION_STD = 0.5 # Increased default action std dev for Rev 5 test
 CLS_NORM_CLIP_VAL = 100.0
 MODULE_OUTPUT_CLIP_VAL = 100.0
-ACTION_MEAN_CLIP_VAL = 10.0 # Reduced action mean clip value
-GRAD_CLIP_NORM = 0.5 # Reduced Max norm for gradient clipping
+ACTION_MEAN_CLIP_VAL = 5.0 # Further reduced action mean clip value for Rev 5 test
+GRAD_CLIP_NORM = 0.5 # Keep reduced Max norm for gradient clipping
 META_REWARD_CLIP = 10.0 # Clipping range for meta-model reward signal
 
 
@@ -57,11 +57,11 @@ class MathEncoder(nn.Module):
         return i_math.coalesce()
 
 
-# --- Predictive Module (Base Class - Revised for Action Mean Clipping, Weight Decay) ---
+# --- Predictive Module (Base Class - Revised for Action Mean Clipping, Weight Decay, DISABLED LEARNING) ---
 class PredictiveModule(nn.Module):
     """
     Base class for DPLD modules: Read, Predict, Write.
-    Learns via normalized simple difference reward (-Sm_log) + entropy bonus.
+    LEARNING DISABLED FOR REV 5 STABILITY TEST.
     Uses LOG-SURPRISE internally and for influence scaling.
     Includes stability clamping, action mean clipping, and weight decay.
     """
@@ -104,12 +104,14 @@ class PredictiveModule(nn.Module):
         self.last_log_prob = None
         self.last_action_dist = None
 
-        self.optimizer = optim.Adam(list(self.fm.parameters()) + [self.qm], lr=learning_rate, weight_decay=weight_decay) # Use passed weight_decay
+        # Optimizer is created but step() won't be called in learn()
+        self.optimizer = optim.Adam(list(self.fm.parameters()) + [self.qm], lr=learning_rate, weight_decay=weight_decay)
 
     def predict(self, ct):
         ct_dense = ct.to_dense() if ct.is_sparse else ct
-        prediction = self.fm(ct_dense.detach())
-        prediction = torch.clamp(prediction, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
+        with torch.no_grad(): # Ensure no gradients tracked during prediction if learning is off
+            prediction = self.fm(ct_dense.detach())
+            prediction = torch.clamp(prediction, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
         self.last_prediction_ct_plus_1 = prediction
         return self.last_prediction_ct_plus_1
 
@@ -169,8 +171,9 @@ class PredictiveModule(nn.Module):
         vm = self.last_prediction_ct_plus_1
         ct_dense = ct.to_dense() if ct.is_sparse else ct
         tau_g = 1.0
-        gate_raw_score = self.qm * ct_dense.detach()
-        gate_activation_gm = torch.sigmoid(gate_raw_score / tau_g)
+        with torch.no_grad(): # Ensure gating calculation doesn't track grads if learning is off
+            gate_raw_score = self.qm * ct_dense.detach()
+            gate_activation_gm = torch.sigmoid(gate_raw_score / tau_g)
         alpha_base = 1.0
         alpha_scale = 1.0
         influence_scalar_am = alpha_base + alpha_scale * torch.tanh(self.surprise_scale_factor * log_surprise_diff)
@@ -190,11 +193,12 @@ class PredictiveModule(nn.Module):
             dist = Normal(action_mean, action_std_tensor)
             self.last_action_dist = dist # Store distribution for entropy
             dense_write_vector_sampled = dist.sample()
-            self.last_log_prob = dist.log_prob(dense_write_vector_sampled).sum() # Use the sampled action
+            # self.last_log_prob = dist.log_prob(dense_write_vector_sampled).sum() # Don't need log_prob if not learning
+            self.last_log_prob = None # Explicitly set to None
         except ValueError as e:
              print(f"ERROR creating Normal distribution in {self.__class__.__name__}: {e}")
              dense_write_vector_sampled = torch.zeros_like(action_mean)
-             self.last_log_prob = torch.tensor(0.0, device=self.device)
+             self.last_log_prob = None
              self.last_action_dist = None
 
         write_vector_im_sparse_vals = sparsify_vector(dense_write_vector_sampled, self.k_sparse_write)
@@ -210,74 +214,73 @@ class PredictiveModule(nn.Module):
         return im_sparse.coalesce()
 
     def learn(self, normalized_difference_reward_rm):
-        """Updates module parameters using normalized simple difference reward (-Sm_log) and entropy bonus."""
-        entropy_tensor = torch.tensor(0.0, device=self.device) # Initialize as tensor
+        """LEARNING DISABLED FOR REV 5. Returns dummy values."""
+        # --- START: LEARNING DISABLED ---
+        # if self.last_log_prob is None or self.last_log_prob == 0.0:
+        #      return 0.0, 0.0, 0.0, 0.0
+        #
+        # if not math.isfinite(normalized_difference_reward_rm):
+        #      self.last_log_prob = None
+        #      self.last_action_dist = None
+        #      return 0.0, 0.0, 0.0, 0.0
+        #
+        # entropy_tensor = torch.tensor(0.0, device=self.device)
+        # entropy_item = 0.0
+        # if self.last_action_dist is not None:
+        #     try:
+        #         entropy_tensor = self.last_action_dist.entropy().sum()
+        #         if not torch.isfinite(entropy_tensor): entropy_tensor = torch.tensor(0.0, device=self.device)
+        #         entropy_item = entropy_tensor.item()
+        #     except Exception: entropy_tensor = torch.tensor(0.0, device=self.device); entropy_item = 0.0
+        #
+        # entropy_term = self.entropy_coeff * entropy_tensor
+        # reward_tensor = torch.tensor(normalized_difference_reward_rm, device=self.device)
+        #
+        # if not torch.isfinite(self.last_log_prob):
+        #     self.last_log_prob = None; self.last_action_dist = None
+        #     return 0.0, 0.0, entropy_item, 0.0
+        #
+        # policy_loss = -(reward_tensor * self.last_log_prob + entropy_term)
+        #
+        # if not torch.isfinite(policy_loss):
+        #     self.last_log_prob = None; self.last_action_dist = None
+        #     return 0.0, 0.0, entropy_item, 0.0
+        #
+        # self.optimizer.zero_grad()
+        # policy_loss.backward()
+        #
+        # params_to_clip = list(self.fm.parameters()) + [self.qm]
+        # grad_norm = nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM).item()
+        # if not math.isfinite(grad_norm): grad_norm = float('nan')
+        #
+        # self.optimizer.step()
+        #
+        # policy_loss_item = policy_loss.item()
+        # task_loss_item = self.last_log_surprise_sm_task.item() if self.last_log_surprise_sm_task is not None else 0.0
+        #
+        # self.last_log_prob = None
+        # self.last_action_dist = None
+        #
+        # return policy_loss_item, task_loss_item, entropy_item, grad_norm
+        # --- END: LEARNING DISABLED ---
+
+        # Return dummy values
         entropy_item = 0.0
-        grad_norm = 0.0
-
-        if self.last_log_prob is None or self.last_log_prob == 0.0:
-             return 0.0, 0.0, entropy_item, grad_norm
-
-        if not math.isfinite(normalized_difference_reward_rm):
-             self.last_log_prob = None
-             self.last_action_dist = None
-             return 0.0, 0.0, entropy_item, grad_norm
-
         if self.last_action_dist is not None:
-            try:
-                entropy_tensor = self.last_action_dist.entropy().sum() # Keep as tensor initially
-                if not torch.isfinite(entropy_tensor):
-                    entropy_tensor = torch.tensor(0.0, device=self.device)
-                entropy_item = entropy_tensor.item() # Get item for logging later
-            except Exception as e:
-                 print(f"Error calculating entropy in {self.__class__.__name__}: {e}")
-                 entropy_tensor = torch.tensor(0.0, device=self.device)
-                 entropy_item = 0.0
+             try: entropy_item = self.last_action_dist.entropy().sum().item()
+             except Exception: pass
+             if not math.isfinite(entropy_item): entropy_item = 0.0
 
-        entropy_term = self.entropy_coeff * entropy_tensor # Use tensor in loss calculation
-
-        reward_tensor = torch.tensor(normalized_difference_reward_rm, device=self.device)
-        if not torch.isfinite(self.last_log_prob):
-            self.last_log_prob = None
-            self.last_action_dist = None
-            return 0.0, 0.0, entropy_item, grad_norm
-
-        policy_loss = -(reward_tensor * self.last_log_prob + entropy_term) # Minimize -(Reward*log_prob + H)
-
-        if not torch.isfinite(policy_loss):
-            self.last_log_prob = None
-            self.last_action_dist = None
-            return 0.0, 0.0, entropy_item, grad_norm
-
-        self.optimizer.zero_grad()
-        policy_loss.backward()
-
-        params_to_clip = list(self.fm.parameters()) + [self.qm]
-        total_norm_sq = 0.0
-        for p in params_to_clip:
-            if p.grad is not None:
-                param_norm_sq = p.grad.detach().data.norm(2).pow(2)
-                if math.isfinite(param_norm_sq): total_norm_sq += param_norm_sq
-        grad_norm = math.sqrt(total_norm_sq) if math.isfinite(total_norm_sq) else float('nan')
-
-        # Use updated GRAD_CLIP_NORM
-        nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
-        self.optimizer.step()
-
-        policy_loss_item = policy_loss.item()
-        # Task loss is now always 0 for base module, and TaskHead calculates only CLS surprise
-        task_loss_item = self.last_log_surprise_sm_task.item() if self.last_log_surprise_sm_task is not None else 0.0
-
-        self.last_log_prob = None
-        self.last_action_dist = None
-
-        return policy_loss_item, task_loss_item, entropy_item, grad_norm
+        self.last_log_prob = None # Ensure reset
+        self.last_action_dist = None # Ensure reset
+        return 0.0, 0.0, entropy_item, 0.0 # Return 0 loss, 0 task loss, calculated entropy, 0 grad norm
 
 
-# --- Task Head Module (Arithmetic Prediction - Revised for Task Disable, Weight Decay) ---
+# --- Task Head Module (Arithmetic Prediction - Revised for Task Disable, Weight Decay, DISABLED LEARNING) ---
 class TaskHead(PredictiveModule):
     """
     Specialized PredictiveModule for the arithmetic task.
+    LEARNING DISABLED FOR REV 5 STABILITY TEST.
     Uses LOG-SURPRISE. Internal model `fm` uses a GRU.
     TASK SURPRISE CALCULATION IS DISABLED FOR REV 4. Behaves like PredictiveModule for surprise.
     Includes weight decay.
@@ -298,6 +301,7 @@ class TaskHead(PredictiveModule):
         self.task_out_layer = nn.Linear(module_hidden_dim, 1).to(device) # Still needed for prediction structure
         self.cls_pred_layer = nn.Linear(module_hidden_dim, cls_dim).to(device)
 
+        # Optimizer is created but step() won't be called in learn()
         self.optimizer = optim.Adam(
             list(self.gru.parameters()) +
             list(self.task_out_layer.parameters()) +
@@ -318,70 +322,29 @@ class TaskHead(PredictiveModule):
         if hidden_state_input is not None and hidden_state_input.shape[1] != ct_input.shape[0]:
              hidden_state_input = None
 
-        gru_output, self.last_gru_hidden_state = self.gru(ct_input, hidden_state_input)
-        last_hidden = gru_output[:, -1, :]
-        predicted_answer = self.task_out_layer(last_hidden).squeeze()
-        self.last_task_prediction = torch.clamp(predicted_answer, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
-        predicted_cls = self.cls_pred_layer(last_hidden).squeeze(0)
-        self.last_prediction_ct_plus_1 = torch.clamp(predicted_cls, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
+        with torch.no_grad(): # Ensure no gradients tracked during prediction if learning is off
+            gru_output, self.last_gru_hidden_state = self.gru(ct_input, hidden_state_input)
+            last_hidden = gru_output[:, -1, :]
+            predicted_answer = self.task_out_layer(last_hidden).squeeze()
+            self.last_task_prediction = torch.clamp(predicted_answer, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
+            predicted_cls = self.cls_pred_layer(last_hidden).squeeze(0)
+            self.last_prediction_ct_plus_1 = torch.clamp(predicted_cls, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
         return self.last_prediction_ct_plus_1
 
-    def calculate_surprise(self, actual_ct_plus_1, true_task_output=None):
-        """Calculates Sm = log(1+Sm_cls). Task surprise ignored."""
-        actual_ct_plus_1_dense = actual_ct_plus_1.to_dense() if actual_ct_plus_1.is_sparse else actual_ct_plus_1
-
-        if self.last_prediction_ct_plus_1 is None: # Task prediction check removed
-             self.last_log_surprise_sm = self.sm_log_baseline.detach()
-             self.last_log_surprise_sm_cls = self.sm_log_baseline.detach()
-             self.last_log_surprise_sm_task = torch.tensor(0.0, device=self.device) # Task surprise is 0
-             self.last_raw_surprise_sm_cls = torch.tensor(float('nan'), device=self.device)
-             self.last_raw_surprise_sm_task = torch.tensor(0.0, device=self.device) # Task surprise is 0
-             return self.last_log_surprise_sm
-
-        # --- Calculate RAW Sm_cls ---
-        if not torch.all(torch.isfinite(self.last_prediction_ct_plus_1)):
-            sm_cls_raw = torch.tensor(1e6, device=self.device)
-        else:
-            sm_cls_raw = F.mse_loss(self.last_prediction_ct_plus_1, actual_ct_plus_1_dense.detach(), reduction='mean')
-        self.last_raw_surprise_sm_cls = sm_cls_raw.detach()
-
-        # --- Calculate RAW Sm_task (but ignore it) ---
-        sm_task_raw = torch.tensor(0.0, device=self.device)
-        # if self.last_task_prediction is not None and true_task_output is not None and torch.all(torch.isfinite(self.last_task_prediction)):
-        #     true_task_output = true_task_output.to(self.device).to(self.last_task_prediction.dtype)
-        #     sm_task_raw = F.mse_loss(self.last_task_prediction, true_task_output.detach(), reduction='mean')
-        self.last_raw_surprise_sm_task = sm_task_raw.detach() # Store 0
-
-        # --- Apply Log Transform ---
-        sm_cls_log = torch.log1p(sm_cls_raw + EPSILON)
-        sm_task_log = torch.tensor(0.0, device=self.device) # Task log surprise is 0
-
-        self.last_log_surprise_sm_cls = sm_cls_log.detach()
-        self.last_log_surprise_sm_task = sm_task_log.detach()
-
-        # --- Combine LOG-Surprises (Only CLS part matters) ---
-        combined_log_surprise = sm_cls_log #+ self.task_loss_weight * sm_task_log (weight is 0)
-
-        if not math.isfinite(combined_log_surprise.item()):
-            self.last_log_surprise_sm = self.sm_log_baseline.detach()
-        else:
-            self.last_log_surprise_sm = combined_log_surprise
-            with torch.no_grad():
-                self.sm_log_baseline = self.surprise_baseline_ema * self.sm_log_baseline + \
-                                       (1 - self.surprise_baseline_ema) * self.last_log_surprise_sm
-
-        return self.last_log_surprise_sm
+    # calculate_surprise is inherited from PredictiveModule and correctly handles task_loss_weight=0
 
     def get_task_prediction(self):
         # Still provide prediction, even if not used for surprise/learning
         return self.last_task_prediction
 
+    # learn method is inherited from PredictiveModule, which now returns dummy values
 
-# --- Meta-Model (Revised for Weight Decay, Stability Target) ---
+
+# --- Meta-Model (Revised for Weight Decay, Stability Target - LEARNING ENABLED) ---
 class MetaModel(nn.Module):
     """
     Implements DPLD Meta-Model for stability regulation.
-    Uses smoothed inputs (EMA Gt, EMA lambda_max) and clips reward.
+    LEARNING IS ENABLED. Uses smoothed inputs (EMA Gt, EMA lambda_max) and clips reward.
     Includes weight decay. Stability target can be set high to ignore LE.
     """
     def __init__(self, meta_input_dim, meta_hidden_dim, learning_rate, cls_dim,
@@ -420,10 +383,11 @@ class MetaModel(nn.Module):
         if hidden_state_input is not None and hidden_state_input.shape[1] != meta_input.shape[0]:
              hidden_state_input = None
 
-        gru_output, self.last_gru_hidden_state = self.gru(meta_input, hidden_state_input)
-        last_hidden = gru_output[:, -1, :]
-        gamma_offset_signal = self.output_layer(last_hidden).squeeze()
-        self.last_gamma_offset_signal = gamma_offset_signal.detach().clone()
+        with torch.no_grad(): # Compute regulation without tracking gradients
+            gru_output, self.last_gru_hidden_state = self.gru(meta_input, hidden_state_input)
+            last_hidden = gru_output[:, -1, :]
+            gamma_offset_signal = self.output_layer(last_hidden).squeeze()
+        self.last_gamma_offset_signal = gamma_offset_signal.detach().clone() # Store the action taken
 
         gamma_offset_tanh = torch.tanh(gamma_offset_signal)
         gamma_center = (self.gamma_max + self.gamma_min) / 2.0
@@ -453,8 +417,9 @@ class MetaModel(nn.Module):
         raw_reward = -(surprise_term + instability_term).detach()
         clipped_reward = torch.clamp(raw_reward, -META_REWARD_CLIP, META_REWARD_CLIP)
 
-        # --- Recompute action prediction ---
+        # --- Recompute action prediction WITH GRADIENTS ---
         hidden_state_input = self.last_gru_hidden_state.detach() if self.last_gru_hidden_state is not None else None
+        # Rerun GRU and output layer to get gradients
         gru_output_rerun, _ = self.gru(self.last_meta_input_smoothed, hidden_state_input)
         last_hidden_rerun = gru_output_rerun[:, -1, :]
         gamma_offset_signal_mean = self.output_layer(last_hidden_rerun).squeeze()
@@ -462,6 +427,7 @@ class MetaModel(nn.Module):
         meta_action_std = torch.tensor(0.1, device=self.device) # Fixed std for meta-action sampling
         try:
             meta_action_dist = Normal(gamma_offset_signal_mean, meta_action_std)
+            # Calculate log_prob of the action we actually took (stored in self.last_gamma_offset_signal)
             log_prob_meta_action = meta_action_dist.log_prob(self.last_gamma_offset_signal)
         except ValueError as e:
              print(f"ERROR creating Meta Normal distribution: {e}")
@@ -501,12 +467,13 @@ class MetaModel(nn.Module):
         return policy_gradient_loss.item(), grad_norm
 
 
-# --- DPLD System (Revised for Simple DR, Task Disable) ---
+# --- DPLD System (Revised for Simple DR, Task Disable, DISABLED MODULE LEARNING) ---
 class DPLDSystem(nn.Module):
     """
     Main DPLD system coordinating CLS, Modules, Meta-Model, and Task components.
+    MODULE LEARNING DISABLED FOR REV 5 STABILITY TEST.
     Uses LOG-SURPRISE for internal calculations.
-    Uses simple difference reward (Rm = -Sm_log). TASK LEARNING DISABLED.
+    Uses simple difference reward (Rm = -Sm_log) conceptually, but modules don't learn.
     Includes EMA smoothing, weight decay, action mean clipping.
     """
     def __init__(self, cls_dim, num_modules, module_hidden_dim, meta_hidden_dim,
@@ -669,7 +636,7 @@ class DPLDSystem(nn.Module):
          return dynamics_map
 
     def step(self, current_step_num, task_input, estimate_le=False, true_answer_c=None): # true_answer_c is now optional
-        """Performs one full step using LOG-SURPRISE and Simple DR (Rm = -Sm_log). TASK LEARNING DISABLED."""
+        """Performs one full step using LOG-SURPRISE. MODULE LEARNING DISABLED."""
 
         a, op_idx, b, _ = task_input # Ignore true_answer_c from input
 
@@ -677,7 +644,6 @@ class DPLDSystem(nn.Module):
              self.ct = self._init_cls()
              self.gt_log_ema = None
              self.lambda_max_ema = None
-             # self.last_log_surprises_sm = None # Not needed
              for module in self.pred_modules: module.sm_log_baseline.fill_(0.0)
              self.task_head.sm_log_baseline.fill_(0.0)
              self.task_head.last_gru_hidden_state = None
@@ -709,29 +675,26 @@ class DPLDSystem(nn.Module):
         # --- 5. Calculate Actual LOG-Surprises & Global LOG-Surprise ---
         current_log_surprises_sm = []
         log_surprises_sm_cls = []
-        # log_surprises_sm_task = [] # Removed
         raw_surprises_sm_cls = []
-        # raw_surprises_sm_task = [] # Removed
         global_log_surprise_gt_sum = 0.0
         valid_surprises = 0
         for module in all_modules: # Includes TaskHead now calculating only CLS surprise
              sm_log = module.calculate_surprise(ct_plus_1, true_task_output=None) # Pass None
              current_log_surprises_sm.append(sm_log.detach()) # Store current step's surprises
              log_surprises_sm_cls.append(module.last_log_surprise_sm_cls)
-             # log_surprises_sm_task.append(module.last_log_surprise_sm_task) # Removed
              raw_surprises_sm_cls.append(module.last_raw_surprise_sm_cls)
-             # raw_surprises_sm_task.append(module.last_raw_surprise_sm_task) # Removed
              if math.isfinite(sm_log.item()): global_log_surprise_gt_sum += sm_log; valid_surprises += 1
 
         global_log_surprise_gt = (global_log_surprise_gt_sum / valid_surprises) if valid_surprises > 0 else torch.tensor(float('nan'), device=self.device)
 
-        # --- 6. Calculate Simple Difference Rewards (Rm = -Sm_log) & Normalize ---
+        # --- 6. Calculate Simple Difference Rewards (Rm = -Sm_log) & Normalize (Conceptually) ---
+        # Not needed for learning, but calculate for logging consistency
         raw_rewards_rm_log = []
         for sm_log in current_log_surprises_sm:
              if sm_log is not None and math.isfinite(sm_log.item()):
                   raw_rewards_rm_log.append(-sm_log.item()) # Reward is negative surprise
              else:
-                  raw_rewards_rm_log.append(0.0) # Default reward if surprise is invalid
+                  raw_rewards_rm_log.append(0.0)
 
         normalized_rewards_rm = []
         mean_rm_log_val = 0.0
@@ -749,9 +712,6 @@ class DPLDSystem(nn.Module):
         else:
              normalized_rewards_rm = [0.0] * len(all_modules)
 
-        # --- Store current surprises for next step's DR calculation - NOT NEEDED ---
-        # self.last_log_surprises_sm = [s.detach().clone() for s in current_log_surprises_sm]
-
         # --- 7. Estimate LE (Optional) ---
         lambda_max_estimate = None
         if estimate_le and torch.all(torch.isfinite(ct_prev_dense)):
@@ -768,10 +728,9 @@ class DPLDSystem(nn.Module):
 
         current_lambda_val = lambda_max_estimate
         if current_lambda_val is not None and math.isfinite(current_lambda_val):
-             # Use stability_target if LE is None or non-finite
              effective_lambda = current_lambda_val
         else:
-             effective_lambda = self.meta_model.stability_target # Use target if LE invalid
+             effective_lambda = self.meta_model.stability_target
 
         if self.lambda_max_ema is None: self.lambda_max_ema = effective_lambda
         else: self.lambda_max_ema = (1 - self.ema_alpha) * effective_lambda + self.ema_alpha * self.lambda_max_ema
@@ -780,39 +739,31 @@ class DPLDSystem(nn.Module):
         # --- 9. Trigger Meta-Model Learning ---
         meta_loss_item, meta_grad_norm = self.meta_model.learn(self.gt_log_ema, self.lambda_max_ema)
 
-        # --- 10. Trigger Module Learning ---
+        # --- 10. Trigger Module Learning (DISABLED) ---
         module_policy_losses = []
-        # module_task_losses_log = [] # Removed
         module_entropies = []
         module_grad_norms = []
         for i, module in enumerate(all_modules):
-            norm_reward = normalized_rewards_rm[i] if i < len(normalized_rewards_rm) else 0.0
-            # Task loss item returned will be 0 now
-            policy_loss, _, entropy, grad_norm = module.learn(norm_reward)
-            module_policy_losses.append(policy_loss)
-            # module_task_losses_log.append(task_loss_log) # Removed
+            # norm_reward = normalized_rewards_rm[i] if i < len(normalized_rewards_rm) else 0.0
+            # Call learn but it returns dummy values and doesn't update
+            policy_loss, _, entropy, grad_norm = module.learn(0.0) # Pass dummy reward
+            module_policy_losses.append(policy_loss) # Will be 0.0
             module_entropies.append(entropy)
-            module_grad_norms.append(grad_norm)
+            module_grad_norms.append(grad_norm) # Will be 0.0
 
         # --- 11. Update State ---
         self.ct = ct_plus_1
 
         # --- 12. Calculate Task Accuracy - REMOVED ---
-        # task_accuracy = 0.0
-        # task_pred_val = self.task_head.get_task_prediction()
-        # if task_pred_val is not None and math.isfinite(task_pred_val.item()):
-        #      task_accuracy = 1.0 if torch.abs(task_pred_val - true_answer_c) < 0.5 else 0.0
 
-        # --- 13. Return Metrics (Log-Surprise Based, Simple DR, Task Disabled) ---
-        finite_sm_log = [s.item() for s in current_log_surprises_sm if s is not None and math.isfinite(s.item())] # Use current step's surprises
+        # --- 13. Return Metrics (Log-Surprise Based, Simple DR, Task Disabled, Module Learning Disabled) ---
+        finite_sm_log = [s.item() for s in current_log_surprises_sm if s is not None and math.isfinite(s.item())]
         finite_sm_log_cls = [s.item() for s in log_surprises_sm_cls if s is not None and math.isfinite(s.item())]
-        # finite_sm_log_task = [s.item() for s in log_surprises_sm_task if s is not None and math.isfinite(s.item())] # Removed
         finite_sm_raw_cls = [s.item() for s in raw_surprises_sm_cls if s is not None and math.isfinite(s.item())]
-        # finite_sm_raw_task = [s.item() for s in raw_surprises_sm_task if s is not None and math.isfinite(s.item())] # Removed
         finite_norm_rewards = [r for r in normalized_rewards_rm if math.isfinite(r)]
-        finite_policy_losses = [l for l in module_policy_losses if l is not None and math.isfinite(l)]
+        finite_policy_losses = [l for l in module_policy_losses if l is not None and math.isfinite(l)] # Will be zeros
         finite_entropies = [e for e in module_entropies if e is not None and math.isfinite(e)]
-        finite_module_grads = [g for g in module_grad_norms if g is not None and math.isfinite(g)]
+        finite_module_grads = [g for g in module_grad_norms if g is not None and math.isfinite(g)] # Will be zeros
 
         metrics = {
             # Log-Surprise Metrics (Only CLS)
@@ -821,16 +772,10 @@ class DPLDSystem(nn.Module):
             "Sm_log_avg": np.mean(finite_sm_log) if finite_sm_log else float('nan'),
             "Sm_log_std": np.std(finite_sm_log) if len(finite_sm_log) > 1 else 0.0,
             "Sm_log_cls_avg": np.mean(finite_sm_log_cls) if finite_sm_log_cls else float('nan'),
-            # "Sm_log_task_avg": np.mean(finite_sm_log_task) if finite_sm_log_task else float('nan'), # Removed
-            # "TaskHead_Sm_log_task": finite_sm_log_task[-1] if finite_sm_log_task else float('nan'), # Removed
             # Raw Surprise Metrics (Only CLS)
             "Sm_raw_cls_avg": np.mean(finite_sm_raw_cls) if finite_sm_raw_cls else float('nan'),
-            # "Sm_raw_task_avg": np.mean(finite_sm_raw_task) if finite_sm_raw_task else float('nan'), # Removed
-            # "TaskHead_Sm_raw_task": finite_sm_raw_task[-1] if finite_sm_raw_task else float('nan'), # Removed
-            # Task Accuracy - REMOVED
-            # "TaskAccuracy": task_accuracy,
             # Reward Metrics (Simple DR: -Sm_log)
-            "Rm_log_raw_avg": mean_rm_log_val if math.isfinite(mean_rm_log_val) else float('nan'), # Now Rm_log = -Sm_log
+            "Rm_log_raw_avg": mean_rm_log_val if math.isfinite(mean_rm_log_val) else float('nan'),
             "Rm_log_raw_std": std_rm_log_val if math.isfinite(std_rm_log_val) else float('nan'),
             "Rm_norm_avg": np.mean(finite_norm_rewards) if finite_norm_rewards else float('nan'),
             "Rm_norm_std": np.std(finite_norm_rewards) if len(finite_norm_rewards) > 1 else 0.0,
@@ -839,7 +784,7 @@ class DPLDSystem(nn.Module):
             "lambda_max_EMA": self.lambda_max_ema,
             "gamma_t": gamma_t,
             "noise_std": noise_std_dev,
-            # Learning Performance
+            # Learning Performance (Module learning disabled)
             "module_loss_avg": np.mean(finite_policy_losses) if finite_policy_losses else float('nan'),
             "meta_loss": meta_loss_item if math.isfinite(meta_loss_item) else float('nan'),
             "module_entropy_avg": np.mean(finite_entropies) if finite_entropies else float('nan'),
