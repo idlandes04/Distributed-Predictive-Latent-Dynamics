@@ -26,7 +26,7 @@ def sparsify_vector(dense_vector, k_sparse_factor):
     sparse_vector[top_k_indices] = dense_vector[top_k_indices]
     return sparse_vector
 
-# --- Lyapunov Exponent Estimation (Unchanged from Rev 7 fix) ---
+# --- Lyapunov Exponent Estimation (Unchanged from Rev 9) ---
 def estimate_lyapunov_exponent(dynamics_map_func, initial_state_dense, n_vectors=5, steps=50, delta_t=1.0, device='cpu'):
     """
     Estimates the largest Lyapunov exponent using Jacobian-vector products.
@@ -41,17 +41,14 @@ def estimate_lyapunov_exponent(dynamics_map_func, initial_state_dense, n_vectors
         Estimated largest Lyapunov exponent (float), or None if unstable.
     """
     dim = initial_state_dense.numel()
-    # Ensure initial state is float64
     state = initial_state_dense.clone().detach().requires_grad_(False).to(device, dtype=torch.float64)
 
-    # Initialize orthonormal vectors
     q = torch.randn(dim, n_vectors, device=device, dtype=torch.float64)
     q, _ = torch.linalg.qr(q)
 
     log_stretch_sum = torch.zeros(n_vectors, device=device, dtype=torch.float64)
 
     for step in range(steps):
-        # Ensure input to dynamics map is float64
         state_input = state.clone().requires_grad_(True)
         next_state = dynamics_map_func(state_input)
 
@@ -65,15 +62,14 @@ def estimate_lyapunov_exponent(dynamics_map_func, initial_state_dense, n_vectors
         for i in range(n_vectors):
             vector = v[:, i].requires_grad_(False)
             try:
-                # Ensure backward call uses float64 vector if needed
                 next_state.backward(vector.to(next_state.dtype), retain_graph=True if i < n_vectors - 1 else False)
                 jvp = state_input.grad.clone().detach()
                 if jvp is None or not torch.all(torch.isfinite(jvp)):
                     print(f"Warning: Non-finite JVP for vector {i} at step {step}. Aborting LE calc.")
-                    state_input.grad.zero_() # Zero grad even if failed
+                    if state_input.grad is not None: state_input.grad.zero_()
                     return None
                 jvp_results.append(jvp)
-                state_input.grad.zero_()
+                if state_input.grad is not None: state_input.grad.zero_() # Ensure grad is zeroed after use
             except RuntimeError as e:
                  print(f"Error during JVP calculation for vector {i} at step {step}: {e}. Aborting LE calc.")
                  return None
@@ -100,7 +96,6 @@ def estimate_lyapunov_exponent(dynamics_map_func, initial_state_dense, n_vectors
 
         log_stretch_sum += torch.log(diag_r.abs())
         q = q_new
-        # Ensure state remains float64
         state = next_state.detach().requires_grad_(False).to(dtype=torch.float64)
 
     lyapunov_exponents = log_stretch_sum / (steps * delta_t)
@@ -122,11 +117,10 @@ def linear_noise_decay(current_step, total_steps, start_noise, end_noise):
     return start_noise - fraction * (start_noise - end_noise)
 
 
-# --- Logging (Revised Header) ---
+# --- Logging (Revised Header for Rev 10) ---
 class Logger:
     def __init__(self, log_dir="logs"):
         self.log_dir = log_dir
-        # Use timestamp in filename to avoid overwriting
         self.log_file = os.path.join(log_dir, f"metrics_{time.strftime('%Y%m%d_%H%M%S')}.csv")
         self.metrics = [] # Buffer for metrics
         self._create_log_file()
@@ -134,14 +128,17 @@ class Logger:
     def _create_log_file(self):
         os.makedirs(self.log_dir, exist_ok=True)
         if not os.path.exists(self.log_file) or os.path.getsize(self.log_file) == 0:
-            # --- MODIFICATION: Updated Header for Rev 8 ---
+            # --- MODIFICATION Rev 10: Updated Header ---
             header = [
                 "step", "Gt_log", "Gt_log_EMA", "Sm_log_avg", "Sm_log_std", "Sm_log_cls_avg",
-                "Sm_raw_cls_avg", "TaskHead_Sm_log_task", "TaskHead_Sm_raw_task", # Added TaskHead specifics
+                "Sm_log_cls_avg_generic", # Added
+                "Sm_raw_cls_avg", "TaskHead_Sm_log_task", "TaskHead_Sm_raw_task",
                 "lambda_max_est", "lambda_max_EMA", "gamma_t", "noise_std",
                 "module_loss_avg", "module_policy_loss_avg", "module_pred_loss_avg",
                 "meta_loss", "module_entropy_avg", "module_grad_norm_avg",
-                "meta_grad_norm", "cls_norm", "cls_density", "OOD_Accuracy", "OOD_Loss"
+                "meta_grad_norm", "cls_norm", "cls_density",
+                "TaskCorrect", "TaskAccuracy_Recent", # Added
+                "OOD_Accuracy", "OOD_Loss"
             ]
             # --- END MODIFICATION ---
             with open(self.log_file, 'w') as f:
@@ -155,22 +152,20 @@ class Logger:
     def save_log(self):
         """Appends buffered metrics to the CSV log file."""
         if not self.metrics:
-            return # Nothing to save
+            return
 
         df = pd.DataFrame(self.metrics)
         try:
-            # Read header to ensure column order and handle missing optional keys
             header_cols = pd.read_csv(self.log_file, nrows=0).columns.tolist()
-            df = df.reindex(columns=header_cols) # Align columns, fill missing with NaN
+            df = df.reindex(columns=header_cols)
         except Exception as e:
             print(f"Warning: Could not read header from log file {self.log_file}. Saving with DataFrame columns. Error: {e}")
 
-        # Append to CSV without writing header again
         df.to_csv(self.log_file, mode='a', header=False, index=False, na_rep='NaN')
-        # print(f"Appended {len(self.metrics)} steps to log file: {self.log_file}") # Reduce verbosity
-        self.metrics = [] # Clear buffer after saving
+        self.metrics = []
 
-# --- Plotting (Unchanged) ---
+
+# --- Plotting (Revised for Rev 10 Metrics) ---
 def plot_metrics(log_file_path):
     """Generates and saves plots from the metrics log file."""
     try:
@@ -188,14 +183,25 @@ def plot_metrics(log_file_path):
     log_dir = os.path.dirname(log_file_path)
     plot_file_path = os.path.join(log_dir, "metrics_plot.png")
 
-    cols_to_plot = [col for col in df.columns if col != 'step' and not df[col].isnull().all() and df[col].dtype != object]
-    num_metrics = len(cols_to_plot)
+    # MODIFIED Rev 10: Define specific columns to plot in order
+    cols_to_plot = [
+        "Gt_log", "Gt_log_EMA", "Sm_log_avg", "Sm_log_std", "Sm_log_cls_avg", "Sm_raw_cls_avg",
+        "TaskHead_Sm_log_task", "TaskHead_Sm_raw_task", "TaskAccuracy_Recent", # Added Task Accuracy
+        "lambda_max_EMA", "gamma_t", "noise_std", # Dynamics/Stability
+        "module_loss_avg", "module_policy_loss_avg", "module_pred_loss_avg", "meta_loss", # Losses
+        "module_entropy_avg", "module_grad_norm_avg", "meta_grad_norm", # Gradients/Entropy
+        "cls_norm", "cls_density", # CLS stats
+        "OOD_Accuracy", "OOD_Loss" # Eval
+    ]
+    # Filter out columns that don't exist or are all NaN
+    cols_to_plot = [col for col in cols_to_plot if col in df.columns and not df[col].isnull().all() and df[col].dtype != object]
 
+    num_metrics = len(cols_to_plot)
     if num_metrics == 0:
         print("No valid numeric metrics found in log file to plot.")
         return
 
-    cols = math.ceil(math.sqrt(num_metrics * 1.6))
+    cols = 6 # Fixed number of columns for consistent layout
     rows = math.ceil(num_metrics / cols)
 
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3), squeeze=False)
@@ -207,10 +213,20 @@ def plot_metrics(log_file_path):
         try:
             valid_data = df[[col, 'step']].dropna()
             if not valid_data.empty:
-                ax.plot(valid_data['step'], valid_data[col], linewidth=0.8) # Thinner lines for dense plots
+                ax.plot(valid_data['step'], valid_data[col], linewidth=0.8)
                 ax.set_title(col)
                 ax.set_xlabel("Step")
                 ax.grid(True)
+                # Specific y-axis limits for certain plots
+                if col == "TaskAccuracy_Recent" or col == "OOD_Accuracy":
+                    ax.set_ylim(-0.05, 1.05)
+                elif col == "lambda_max_EMA":
+                    # Find min/max excluding potential outliers if needed
+                    min_val = valid_data[col].min()
+                    max_val = valid_data[col].max()
+                    padding = max(0.01, (max_val - min_val) * 0.1)
+                    ax.set_ylim(min_val - padding, max_val + padding)
+
             else:
                 ax.set_title(f"{col} (No Valid Data)")
                 ax.text(0.5, 0.5, 'No Valid Data', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
