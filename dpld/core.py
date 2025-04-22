@@ -12,13 +12,14 @@ from utils import estimate_lyapunov_exponent, sparsify_vector # Assuming these a
 
 # --- Constants ---
 EPSILON = 1e-8
-DEFAULT_ACTION_STD = 0.5
+DEFAULT_ACTION_STD = 0.5 # Kept from Rev 7 stability
 CLS_NORM_CLIP_VAL = 100.0
 MODULE_OUTPUT_CLIP_VAL = 100.0
 ACTION_MEAN_CLIP_VAL = 5.0
 GRAD_CLIP_NORM = 1.0
 META_REWARD_CLIP = 10.0
-DEFAULT_PREDICTION_LOSS_WEIGHT = 1.0
+DEFAULT_PREDICTION_LOSS_WEIGHT = 1.0 # Default weight for CLS prediction loss
+DEFAULT_TASK_LOSS_WEIGHT = 1.0 # Default weight for Task prediction loss
 
 
 # --- Math Encoder Module (Unchanged) ---
@@ -58,12 +59,14 @@ class MathEncoder(nn.Module):
         return i_math.coalesce()
 
 
-# --- Predictive Module (Base Class - Combined Loss) ---
+# --- Predictive Module (Base Class - Unchanged from Rev 7) ---
+# No changes needed here as TaskHead will override learn and calculate_surprise
+# Note: task_loss_weight is passed but effectively ignored here.
 class PredictiveModule(nn.Module):
     """
     Base class for DPLD modules: Read, Predict, Write.
     Uses combined loss: Policy Loss (for qm) + Prediction Loss (for fm).
-    Uses simple reward = -local_log_surprise_sm for policy loss.
+    Uses simple reward = -local_log_surprise_sm_cls for policy loss.
     Uses LOG-SURPRISE internally and for influence scaling.
     Includes stability clamping, action mean clipping, and weight decay.
     """
@@ -73,8 +76,8 @@ class PredictiveModule(nn.Module):
                  surprise_baseline_ema=0.99,
                  action_std=DEFAULT_ACTION_STD,
                  prediction_loss_weight=DEFAULT_PREDICTION_LOSS_WEIGHT,
-                 task_loss_weight=0.0, # Task weight is 0
-                 weight_decay=1e-5, # Default weight decay
+                 task_loss_weight=0.0, # Ignored by base class learn/surprise
+                 weight_decay=1e-5,
                  device='cpu'):
         super().__init__()
         self.cls_dim = cls_dim
@@ -86,9 +89,8 @@ class PredictiveModule(nn.Module):
         self.surprise_baseline_ema = surprise_baseline_ema
         self.action_std = action_std
         self.prediction_loss_weight = prediction_loss_weight
-        self.task_loss_weight = task_loss_weight # Will be 0 for base modules
+        # self.task_loss_weight is unused here
 
-        # --- fm: Prediction Network (requires grad for prediction loss) ---
         self.fm = nn.Sequential(
             nn.Linear(cls_dim, module_hidden_dim),
             nn.ReLU(),
@@ -97,31 +99,23 @@ class PredictiveModule(nn.Module):
             nn.Linear(module_hidden_dim, cls_dim)
         ).to(device)
 
-        # --- qm: Gating Parameter (requires grad for policy loss) ---
         self.qm = nn.Parameter(torch.randn(cls_dim, device=device) * 0.01)
 
-        # --- Initialize Buffers and State ---
         self.register_buffer('sm_log_baseline', torch.tensor(0.0, device=device))
         self.last_prediction_ct_plus_1 = None
-        self.last_log_surprise_sm = None
-        # --- MODIFICATION: Initialize last_log_surprise_sm_cls ---
-        # Initialize with a detached tensor value (e.g., initial baseline)
-        self.last_log_surprise_sm_cls = torch.tensor(0.0, device=device)
-        # --- END MODIFICATION ---
-        self.last_log_surprise_sm_task = torch.tensor(0.0, device=device) # Initialized as tensor
+        self.last_log_surprise_sm = None # Grad-enabled combined loss value
+        self.last_log_surprise_sm_cls = torch.tensor(0.0, device=device) # Detached CLS surprise
         self.last_raw_surprise_sm_cls = None
-        self.last_raw_surprise_sm_task = None
         self.last_log_prob = None
         self.last_action_dist = None
 
-        # Optimizer includes fm and qm parameters
         self.optimizer = optim.Adam(list(self.fm.parameters()) + [self.qm], lr=learning_rate, weight_decay=weight_decay)
 
     def predict(self, ct):
         ct_dense = ct.to_dense() if ct.is_sparse else ct
-        prediction = self.fm(ct_dense.detach()) # Detach input ct, but keep grad path through fm
+        prediction = self.fm(ct_dense.detach())
         prediction = torch.clamp(prediction, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
-        self.last_prediction_ct_plus_1 = prediction # Store prediction with grad history
+        self.last_prediction_ct_plus_1 = prediction
         return self.last_prediction_ct_plus_1
 
     def calculate_surprise(self, actual_ct_plus_1, true_task_output=None):
@@ -129,82 +123,57 @@ class PredictiveModule(nn.Module):
         actual_ct_plus_1_dense = actual_ct_plus_1.to_dense() if actual_ct_plus_1.is_sparse else actual_ct_plus_1
 
         if self.last_prediction_ct_plus_1 is None:
-             # Use initial baseline value if no prediction yet
-             self.last_log_surprise_sm = torch.tensor(0.0, device=self.device) # No grad history
+             self.last_log_surprise_sm = torch.tensor(0.0, device=self.device)
              self.last_log_surprise_sm_cls = self.sm_log_baseline.detach()
-             self.last_log_surprise_sm_task = torch.tensor(0.0, device=self.device)
              self.last_raw_surprise_sm_cls = torch.tensor(float('nan'), device=self.device)
-             self.last_raw_surprise_sm_task = torch.tensor(0.0, device=self.device)
-             return self.last_log_surprise_sm # Return detached value
+             return self.last_log_surprise_sm
 
-        # --- Calculate RAW Sm_cls ---
         if not torch.all(torch.isfinite(self.last_prediction_ct_plus_1)):
-            sm_cls_raw = torch.mean((self.last_prediction_ct_plus_1 - actual_ct_plus_1_dense.detach())**2) \
-                         if torch.is_grad_enabled() else torch.tensor(1e6, device=self.device)
-            if not torch.isfinite(sm_cls_raw):
-                 sm_cls_raw = torch.tensor(1e6, device=self.device)
+            sm_cls_raw = torch.tensor(1e6, device=self.device)
+            if torch.is_grad_enabled(): sm_cls_raw = sm_cls_raw.requires_grad_() # Add grad if needed for loss
         else:
             sm_cls_raw = F.mse_loss(self.last_prediction_ct_plus_1, actual_ct_plus_1_dense.detach(), reduction='mean')
-        self.last_raw_surprise_sm_cls = sm_cls_raw.detach() # Store detached raw value
+        self.last_raw_surprise_sm_cls = sm_cls_raw.detach()
 
-        sm_task_raw = torch.tensor(0.0, device=self.device)
-        self.last_raw_surprise_sm_task = sm_task_raw.detach()
-
-        # --- Calculate LOG Sm_cls ---
         sm_cls_log = torch.log1p(sm_cls_raw + EPSILON)
-        sm_task_log = torch.tensor(0.0, device=self.device) # No task component
-
-        # Store detached versions for baseline update and logging
         self.last_log_surprise_sm_cls = sm_cls_log.detach()
-        self.last_log_surprise_sm_task = sm_task_log.detach()
 
-        # Store combined log surprise WITH grad history
-        combined_log_surprise = sm_cls_log # Task weight is 0
+        # Combined surprise for loss = weighted CLS surprise
+        combined_log_surprise = self.prediction_loss_weight * sm_cls_log
 
         if not math.isfinite(combined_log_surprise.item()):
-             self.last_log_surprise_sm = torch.tensor(self.sm_log_baseline.item() + 1.0, device=self.device) # No grad history
+             self.last_log_surprise_sm = torch.tensor(self.sm_log_baseline.item() + 1.0, device=self.device)
         else:
             self.last_log_surprise_sm = combined_log_surprise
             with torch.no_grad():
-                # Ensure baseline update uses a finite value
                 update_val = self.last_log_surprise_sm_cls if torch.isfinite(self.last_log_surprise_sm_cls) else self.sm_log_baseline
                 self.sm_log_baseline = self.surprise_baseline_ema * self.sm_log_baseline + \
                                        (1 - self.surprise_baseline_ema) * update_val
 
-        # Return the grad-enabled log surprise for use in prediction loss
         return self.last_log_surprise_sm
 
     def generate_write_vector(self, ct):
-        """Generates the sparse write vector Im using LOG-SURPRISE for alpha_m."""
+        """Generates the sparse write vector Im using LOG-SURPRISE (CLS part) for alpha_m."""
         if self.last_prediction_ct_plus_1 is None:
-             # Handle case where predict hasn't run (shouldn't happen after step 0)
-             # For action mean calculation, we need vm. Let's use zeros if no prediction.
              vm = torch.zeros(self.cls_dim, device=self.device)
-             current_log_surprise_detached = self.sm_log_baseline.detach() # Use baseline if no surprise calculated
+             current_log_surprise_detached = self.sm_log_baseline.detach()
         else:
-             # Use DETACHED log surprise for influence scaling
-             # Check if last_log_surprise_sm_cls is valid, otherwise use baseline
              current_log_surprise_detached = self.last_log_surprise_sm_cls if self.last_log_surprise_sm_cls is not None and torch.isfinite(self.last_log_surprise_sm_cls) else self.sm_log_baseline.detach()
-             # vm is the prediction from fm, DETACH it for action mean calculation
              vm = self.last_prediction_ct_plus_1.detach()
 
         log_surprise_diff = current_log_surprise_detached - self.sm_log_baseline.detach()
-
         ct_dense = ct.to_dense() if ct.is_sparse else ct
 
-        # --- Gating (Requires Grad through qm) ---
         tau_g = 1.0
         gate_raw_score = self.qm * ct_dense.detach()
-        gate_activation_gm = torch.sigmoid(gate_raw_score / tau_g) # Has grad path to qm
+        gate_activation_gm = torch.sigmoid(gate_raw_score / tau_g)
 
-        # --- Influence (No Grad) ---
         alpha_base = 1.0; alpha_scale = 1.0
         influence_scalar_am = alpha_base + alpha_scale * torch.tanh(self.surprise_scale_factor * log_surprise_diff)
-        influence_scalar_am = torch.clamp(influence_scalar_am, min=0.1, max=10.0).detach() # Detach influence
+        influence_scalar_am = torch.clamp(influence_scalar_am, min=0.1, max=10.0).detach()
 
-        # --- Action Mean Calculation (Requires Grad through qm ONLY) ---
-        intermediate_write_vector = influence_scalar_am * (gate_activation_gm * vm) # Grad path only to qm
-        action_mean = torch.clamp(intermediate_write_vector, -ACTION_MEAN_CLIP_VAL, ACTION_MEAN_CLIP_VAL) # Grad path only to qm
+        intermediate_write_vector = influence_scalar_am * (gate_activation_gm * vm)
+        action_mean = torch.clamp(intermediate_write_vector, -ACTION_MEAN_CLIP_VAL, ACTION_MEAN_CLIP_VAL)
 
         if not torch.all(torch.isfinite(action_mean)):
             action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=ACTION_MEAN_CLIP_VAL, neginf=-ACTION_MEAN_CLIP_VAL)
@@ -213,7 +182,7 @@ class PredictiveModule(nn.Module):
 
         try:
             dist = Normal(action_mean, action_std_tensor)
-            self.last_action_dist = dist # Store for entropy calculation
+            self.last_action_dist = dist
             dense_write_vector_sampled = dist.sample()
             self.last_log_prob = dist.log_prob(dense_write_vector_sampled.detach()).sum()
         except ValueError as e:
@@ -222,7 +191,6 @@ class PredictiveModule(nn.Module):
              self.last_log_prob = None
              self.last_action_dist = None
 
-        # Sparsify the sampled action
         write_vector_im_sparse_vals = sparsify_vector(dense_write_vector_sampled.detach(), self.k_sparse_write)
         sparse_indices = torch.where(write_vector_im_sparse_vals != 0)[0].unsqueeze(0)
         sparse_values = write_vector_im_sparse_vals[sparse_indices.squeeze(0)]
@@ -235,13 +203,11 @@ class PredictiveModule(nn.Module):
                                                  (self.cls_dim,))
         return im_sparse.coalesce()
 
-    def learn(self, local_log_surprise_sm_detached):
+    def learn(self, local_log_surprise_sm_cls_detached):
         """
-        Updates module parameters (fm and qm) using combined loss.
-        Args:
-            local_log_surprise_sm_detached: The detached log-surprise for reward calculation.
-        Returns:
-            total_loss_item, policy_loss_item, prediction_loss_item, entropy_item, grad_norm
+        Updates base module parameters (fm and qm) using combined loss.
+        Policy reward uses negative CLS surprise.
+        Prediction loss uses weighted CLS surprise.
         """
         policy_loss_item = 0.0
         prediction_loss_item = 0.0
@@ -251,16 +217,19 @@ class PredictiveModule(nn.Module):
         # --- 1. Calculate Policy Loss Component (for qm) ---
         policy_loss = torch.tensor(0.0, device=self.device)
         if self.last_log_prob is not None and self.last_action_dist is not None and \
-           local_log_surprise_sm_detached is not None and math.isfinite(local_log_surprise_sm_detached.item()):
+           local_log_surprise_sm_cls_detached is not None and math.isfinite(local_log_surprise_sm_cls_detached.item()):
 
-            reward_tensor = -local_log_surprise_sm_detached # Simple reward
+            reward_tensor = -local_log_surprise_sm_cls_detached # Use CLS surprise for reward
 
             entropy_tensor = torch.tensor(0.0, device=self.device)
             try:
-                entropy_tensor = self.last_action_dist.entropy().sum()
-                if not torch.isfinite(entropy_tensor): entropy_tensor = torch.tensor(0.0, device=self.device)
+                if self.last_action_dist is not None:
+                    entropy_tensor = self.last_action_dist.entropy().sum()
+                    if not torch.isfinite(entropy_tensor): entropy_tensor = torch.tensor(0.0, device=self.device)
                 entropy_item = entropy_tensor.item()
-            except Exception: entropy_tensor = torch.tensor(0.0, device=self.device); entropy_item = 0.0
+            except Exception as e:
+                 print(f"Warning: Entropy calculation error in PredictiveModule: {e}")
+                 entropy_tensor = torch.tensor(0.0, device=self.device); entropy_item = 0.0
 
             entropy_term = self.entropy_coeff * entropy_tensor
 
@@ -270,25 +239,25 @@ class PredictiveModule(nn.Module):
                     policy_loss = torch.tensor(0.0, device=self.device)
             else:
                 policy_loss = torch.tensor(0.0, device=self.device)
-        policy_loss_item = policy_loss.item() # Store item before combining
+        policy_loss_item = policy_loss.item()
 
         # --- 2. Calculate Prediction Loss Component (for fm) ---
         prediction_loss = torch.tensor(0.0, device=self.device)
         # self.last_log_surprise_sm has grad history back to fm (set in calculate_surprise)
         if self.last_log_surprise_sm is not None and torch.is_tensor(self.last_log_surprise_sm) and self.last_log_surprise_sm.requires_grad:
             if torch.isfinite(self.last_log_surprise_sm):
-                prediction_loss = self.prediction_loss_weight * self.last_log_surprise_sm
+                prediction_loss = self.last_log_surprise_sm # Already weighted in calculate_surprise
             else:
-                prediction_loss = torch.tensor(0.0, device=self.device) # Zero out if NaN/Inf
-        prediction_loss_item = prediction_loss.item() # Store item before combining
+                prediction_loss = torch.tensor(0.0, device=self.device)
+        prediction_loss_item = prediction_loss.item()
 
         # --- 3. Combine Losses ---
         total_loss = policy_loss + prediction_loss
 
         # --- 4. Backpropagation and Optimizer Step ---
-        if torch.isfinite(total_loss) and total_loss.requires_grad: # Check requires_grad
+        if torch.isfinite(total_loss) and total_loss.requires_grad:
             self.optimizer.zero_grad()
-            total_loss.backward() # Calculate gradients for fm and qm
+            total_loss.backward()
 
             params_to_clip = list(self.fm.parameters()) + [self.qm]
 
@@ -302,53 +271,48 @@ class PredictiveModule(nn.Module):
             nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
             self.optimizer.step()
         else:
-            # If loss is invalid or no grads, skip optimizer step
             grad_norm = 0.0
-            # If loss is NaN/Inf, print a warning
             if not torch.isfinite(total_loss):
                 print(f"Warning: NaN/Inf total_loss in {self.__class__.__name__}.learn(). Policy: {policy_loss_item}, Pred: {prediction_loss_item}")
 
-
-        # Reset state for next step
         self.last_log_prob = None
         self.last_action_dist = None
-        # Keep self.last_log_surprise_sm as it's set by calculate_surprise next step
 
         return total_loss.item(), policy_loss_item, prediction_loss_item, entropy_item, grad_norm
 
 
-# --- Task Head Module (Combined Loss - Inherits changes) ---
+# --- Task Head Module (Overrides calculate_surprise and learn) ---
 class TaskHead(PredictiveModule):
     """
     Specialized PredictiveModule for the arithmetic task.
-    Uses combined loss: Policy Loss (for qm) + Prediction Loss (for GRU/Linear).
-    Uses simple reward = -local_log_surprise_sm (which is only CLS surprise).
+    Prediction Loss = weight_cls * Sm_cls + weight_task * Sm_task
+    Policy Reward = -Sm_task (detached)
     Uses LOG-SURPRISE. Internal model `fm` uses a GRU.
-    TASK SURPRISE CALCULATION REMAINS DISABLED.
     Includes weight decay.
     """
     def __init__(self, cls_dim, module_hidden_dim, k_sparse_write, learning_rate,
                  entropy_coeff=0.01,
                  surprise_scale_factor=1.0, surprise_baseline_ema=0.99,
                  action_std=DEFAULT_ACTION_STD,
-                 prediction_loss_weight=DEFAULT_PREDICTION_LOSS_WEIGHT, # Added
-                 task_loss_weight=0.0, # TASK WEIGHT DISABLED
-                 weight_decay=1e-5, # Default weight decay
+                 prediction_loss_weight=DEFAULT_PREDICTION_LOSS_WEIGHT, # Weight for CLS part
+                 task_loss_weight=DEFAULT_TASK_LOSS_WEIGHT, # Weight for Task part
+                 weight_decay=1e-5,
                  gru_layers=1, device='cpu'):
-        # Initialize PredictiveModule with task_loss_weight=0.0 and prediction_loss_weight
+        # Initialize PredictiveModule - pass weights
         super().__init__(cls_dim, module_hidden_dim, k_sparse_write, learning_rate,
                          entropy_coeff, surprise_scale_factor, surprise_baseline_ema, action_std,
-                         prediction_loss_weight=prediction_loss_weight, # Pass prediction weight
-                         task_loss_weight=0.0, # Force task weight to 0
-                         weight_decay=weight_decay, device=device) # Pass weight_decay
+                         prediction_loss_weight=prediction_loss_weight,
+                         task_loss_weight=task_loss_weight, # Pass task weight
+                         weight_decay=weight_decay, device=device)
+
+        # Store task loss weight specifically for TaskHead
+        self.task_loss_weight = task_loss_weight
 
         # --- fm: Prediction Network (GRU + Linear layers) ---
-        # Redefine fm components for TaskHead
         self.gru = nn.GRU(cls_dim, module_hidden_dim, num_layers=gru_layers, batch_first=True).to(device)
-        self.task_out_layer = nn.Linear(module_hidden_dim, 1).to(device) # Predicts task answer
-        self.cls_pred_layer = nn.Linear(module_hidden_dim, cls_dim).to(device) # Predicts next CLS state
+        self.task_out_layer = nn.Linear(module_hidden_dim, 1).to(device)
+        self.cls_pred_layer = nn.Linear(module_hidden_dim, cls_dim).to(device)
 
-        # Optimizer includes GRU, output layers, and qm
         # Re-define optimizer to include TaskHead specific layers instead of base fm
         self.optimizer = optim.Adam(
             list(self.gru.parameters()) +
@@ -360,46 +324,174 @@ class TaskHead(PredictiveModule):
         )
 
         self.last_gru_hidden_state = None
-        self.last_task_prediction = None # Stores task prediction (no grad needed after loss calc)
+        self.last_task_prediction = None # Stores detached task prediction
+        # Inherits last_log_surprise_sm_cls, last_raw_surprise_sm_cls from base
+        # Add specific storage for task surprise
+        self.last_log_surprise_sm_task = torch.tensor(0.0, device=device) # Detached task surprise
+        self.last_raw_surprise_sm_task = None
 
     def predict(self, ct):
         """Predicts both next CLS state and task answer."""
         ct_dense = ct.to_dense() if ct.is_sparse else ct
-        ct_input = ct_dense.detach().unsqueeze(0).unsqueeze(0) # Detach input ct
+        ct_input = ct_dense.detach().unsqueeze(0).unsqueeze(0)
         hidden_state_input = self.last_gru_hidden_state.detach() if self.last_gru_hidden_state is not None else None
 
         if hidden_state_input is not None and hidden_state_input.shape[1] != ct_input.shape[0]:
              hidden_state_input = None
 
-        # GRU requires grad for fm update
         gru_output, next_hidden_state = self.gru(ct_input, hidden_state_input)
-        # Detach hidden state before storing if not needed for BPTT (which we aren't doing across steps here)
         self.last_gru_hidden_state = next_hidden_state.detach()
 
-        last_hidden = gru_output[:, -1, :] # This depends on GRU params
+        last_hidden = gru_output[:, -1, :]
 
-        # Task prediction (no grad needed after loss calculation)
-        predicted_answer = self.task_out_layer(last_hidden).squeeze() # Depends on task_out params
-        self.last_task_prediction = torch.clamp(predicted_answer, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL).detach() # Store detached
+        predicted_answer = self.task_out_layer(last_hidden).squeeze()
+        self.last_task_prediction = torch.clamp(predicted_answer, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL).detach()
 
-        # CLS prediction (needs grad history for prediction loss)
-        predicted_cls = self.cls_pred_layer(last_hidden).squeeze(0) # Depends on cls_pred params
-        self.last_prediction_ct_plus_1 = torch.clamp(predicted_cls, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL) # Store with grad history
+        predicted_cls = self.cls_pred_layer(last_hidden).squeeze(0)
+        self.last_prediction_ct_plus_1 = torch.clamp(predicted_cls, -MODULE_OUTPUT_CLIP_VAL, MODULE_OUTPUT_CLIP_VAL)
 
-        # Return the CLS prediction (with grad history)
         return self.last_prediction_ct_plus_1
 
-    # calculate_surprise is inherited from PredictiveModule (task_loss_weight=0)
+    def calculate_surprise(self, actual_ct_plus_1, true_task_output=None):
+        """Calculates combined LOG-SURPRISE Sm for TaskHead."""
+        actual_ct_plus_1_dense = actual_ct_plus_1.to_dense() if actual_ct_plus_1.is_sparse else actual_ct_plus_1
+
+        if self.last_prediction_ct_plus_1 is None or self.last_task_prediction is None:
+             self.last_log_surprise_sm = torch.tensor(0.0, device=self.device)
+             self.last_log_surprise_sm_cls = self.sm_log_baseline.detach()
+             self.last_log_surprise_sm_task = torch.tensor(0.0, device=self.device)
+             self.last_raw_surprise_sm_cls = torch.tensor(float('nan'), device=self.device)
+             self.last_raw_surprise_sm_task = torch.tensor(float('nan'), device=self.device)
+             return self.last_log_surprise_sm
+
+        # --- Calculate CLS Surprise ---
+        if not torch.all(torch.isfinite(self.last_prediction_ct_plus_1)):
+            sm_cls_raw = torch.tensor(1e6, device=self.device)
+            if torch.is_grad_enabled(): sm_cls_raw = sm_cls_raw.requires_grad_()
+        else:
+            sm_cls_raw = F.mse_loss(self.last_prediction_ct_plus_1, actual_ct_plus_1_dense.detach(), reduction='mean')
+        self.last_raw_surprise_sm_cls = sm_cls_raw.detach()
+        sm_cls_log = torch.log1p(sm_cls_raw + EPSILON)
+        self.last_log_surprise_sm_cls = sm_cls_log.detach()
+
+        # --- Calculate Task Surprise ---
+        if true_task_output is not None and torch.all(torch.isfinite(self.last_task_prediction)) and torch.isfinite(true_task_output):
+            sm_task_raw = F.mse_loss(self.last_task_prediction.detach(), true_task_output.float().detach(), reduction='mean') # Use detached pred for raw calc
+            # Need grad-enabled version for loss calculation
+            sm_task_raw_grad = F.mse_loss(self.task_out_layer(self.gru(self.last_prediction_ct_plus_1.unsqueeze(0).unsqueeze(0))[0][:, -1, :]).squeeze(), # Rerun task pred part with grad
+                                          true_task_output.float().detach(), reduction='mean')
+        else:
+            sm_task_raw = torch.tensor(1e6, device=self.device)
+            sm_task_raw_grad = torch.tensor(1e6, device=self.device)
+            if torch.is_grad_enabled(): sm_task_raw_grad = sm_task_raw_grad.requires_grad_()
+
+        self.last_raw_surprise_sm_task = sm_task_raw.detach()
+        sm_task_log = torch.log1p(sm_task_raw_grad + EPSILON) # Use grad version for log surprise
+        self.last_log_surprise_sm_task = sm_task_log.detach() # Store detached log task surprise
+
+        # --- Combine for Prediction Loss ---
+        # Use grad-enabled log surprises
+        combined_log_surprise = self.prediction_loss_weight * sm_cls_log + \
+                                self.task_loss_weight * sm_task_log
+
+        if not math.isfinite(combined_log_surprise.item()):
+             self.last_log_surprise_sm = torch.tensor(self.sm_log_baseline.item() + 1.0, device=self.device) # No grad history
+        else:
+            self.last_log_surprise_sm = combined_log_surprise
+            # Update baseline using only CLS surprise
+            with torch.no_grad():
+                update_val = self.last_log_surprise_sm_cls if torch.isfinite(self.last_log_surprise_sm_cls) else self.sm_log_baseline
+                self.sm_log_baseline = self.surprise_baseline_ema * self.sm_log_baseline + \
+                                       (1 - self.surprise_baseline_ema) * update_val
+
+        return self.last_log_surprise_sm
 
     def get_task_prediction(self):
-        # Returns the detached task prediction made in the predict step
         return self.last_task_prediction
 
-    # learn method is inherited from PredictiveModule, which now uses combined loss
-    # The optimizer defined in __init__ will correctly update GRU, Linear, and qm params.
+    def learn(self, _): # Argument ignored, uses internal state
+        """
+        Updates TaskHead parameters (fm=GRU/Linear and qm) using combined loss.
+        Uses TASK surprise for policy reward.
+        """
+        policy_loss_item = 0.0
+        prediction_loss_item = 0.0
+        entropy_item = 0.0
+        grad_norm = 0.0
+
+        # --- 1. Calculate Policy Loss Component (for qm) ---
+        policy_loss = torch.tensor(0.0, device=self.device)
+        # Use DETACHED negative TASK log surprise as reward
+        if self.last_log_prob is not None and self.last_action_dist is not None and \
+           self.last_log_surprise_sm_task is not None and math.isfinite(self.last_log_surprise_sm_task.item()):
+
+            reward_tensor = -self.last_log_surprise_sm_task.detach() # Use task surprise
+
+            entropy_tensor = torch.tensor(0.0, device=self.device)
+            try:
+                if self.last_action_dist is not None: # Check if dist is valid
+                    entropy_tensor = self.last_action_dist.entropy().sum()
+                    if not torch.isfinite(entropy_tensor): entropy_tensor = torch.tensor(0.0, device=self.device)
+                entropy_item = entropy_tensor.item()
+            except Exception as e:
+                 print(f"Warning: Entropy calculation error in TaskHead: {e}")
+                 entropy_tensor = torch.tensor(0.0, device=self.device); entropy_item = 0.0
+
+            entropy_term = self.entropy_coeff * entropy_tensor
+
+            if torch.isfinite(self.last_log_prob):
+                policy_loss = -(reward_tensor * self.last_log_prob + entropy_term)
+                if not torch.isfinite(policy_loss):
+                    policy_loss = torch.tensor(0.0, device=self.device)
+            else:
+                policy_loss = torch.tensor(0.0, device=self.device)
+        policy_loss_item = policy_loss.item()
+
+        # --- 2. Calculate Prediction Loss Component (for fm=GRU/Linear) ---
+        prediction_loss = torch.tensor(0.0, device=self.device)
+        # self.last_log_surprise_sm has grad history back to fm (set in calculate_surprise)
+        # and now includes the weighted task surprise component.
+        if self.last_log_surprise_sm is not None and torch.is_tensor(self.last_log_surprise_sm) and self.last_log_surprise_sm.requires_grad:
+            if torch.isfinite(self.last_log_surprise_sm):
+                prediction_loss = self.last_log_surprise_sm # Already weighted in calculate_surprise
+            else:
+                prediction_loss = torch.tensor(0.0, device=self.device)
+        prediction_loss_item = prediction_loss.item()
+
+        # --- 3. Combine Losses ---
+        total_loss = policy_loss + prediction_loss
+
+        # --- 4. Backpropagation and Optimizer Step ---
+        if torch.isfinite(total_loss) and total_loss.requires_grad:
+            self.optimizer.zero_grad()
+            total_loss.backward()
+
+            params_to_clip = list(self.gru.parameters()) + \
+                             list(self.task_out_layer.parameters()) + \
+                             list(self.cls_pred_layer.parameters()) + \
+                             [self.qm]
+
+            total_norm_sq = 0.0
+            for p in params_to_clip:
+                if p.grad is not None:
+                     param_norm_sq = p.grad.detach().data.norm(2).pow(2)
+                     if math.isfinite(param_norm_sq): total_norm_sq += param_norm_sq
+            grad_norm = math.sqrt(total_norm_sq) if math.isfinite(total_norm_sq) else float('nan')
+
+            nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
+            self.optimizer.step()
+        else:
+            grad_norm = 0.0
+            if not torch.isfinite(total_loss):
+                print(f"Warning: NaN/Inf total_loss in TaskHead.learn(). Policy: {policy_loss_item}, Pred: {prediction_loss_item}")
+
+        self.last_log_prob = None
+        self.last_action_dist = None
+
+        return total_loss.item(), policy_loss_item, prediction_loss_item, entropy_item, grad_norm
 
 
-# --- Meta-Model (Unchanged) ---
+# --- Meta-Model (Unchanged from Rev 7) ---
 class MetaModel(nn.Module):
     """
     Implements DPLD Meta-Model for stability regulation.
@@ -407,8 +499,8 @@ class MetaModel(nn.Module):
     Includes weight decay. Stability target can be set high to ignore LE.
     """
     def __init__(self, meta_input_dim, meta_hidden_dim, learning_rate, cls_dim,
-                 gamma_min=0.01, gamma_max=0.2, stability_target=-100.0,
-                 weight_decay=1e-5, # Default weight decay
+                 gamma_min=0.01, gamma_max=0.2, stability_target=-0.01, # Default target closer to 0
+                 weight_decay=1e-5,
                  gru_layers=1, instability_weight=1.0, surprise_weight=0.1, device='cpu'):
         super().__init__()
         self.device = device
@@ -442,7 +534,7 @@ class MetaModel(nn.Module):
 
         with torch.no_grad():
             gru_output, next_hidden_state = self.gru(meta_input, hidden_state_input)
-            self.last_gru_hidden_state = next_hidden_state.detach() # Store detached hidden state
+            self.last_gru_hidden_state = next_hidden_state.detach()
             last_hidden = gru_output[:, -1, :]
             gamma_offset_signal = self.output_layer(last_hidden).squeeze()
         self.last_gamma_offset_signal = gamma_offset_signal.detach().clone()
@@ -472,16 +564,15 @@ class MetaModel(nn.Module):
         raw_reward = -(surprise_term + instability_term).detach()
         clipped_reward = torch.clamp(raw_reward, -META_REWARD_CLIP, META_REWARD_CLIP)
 
-        # Rerun the forward pass to get grad history
-        hidden_state_input = self.last_gru_hidden_state.detach() if self.last_gru_hidden_state is not None else None # Use detached hidden state
+        hidden_state_input = self.last_gru_hidden_state.detach() if self.last_gru_hidden_state is not None else None
         gru_output_rerun, _ = self.gru(self.last_meta_input_smoothed, hidden_state_input)
         last_hidden_rerun = gru_output_rerun[:, -1, :]
-        gamma_offset_signal_mean = self.output_layer(last_hidden_rerun).squeeze() # Has grad history
+        gamma_offset_signal_mean = self.output_layer(last_hidden_rerun).squeeze()
 
         meta_action_std = torch.tensor(0.1, device=self.device)
         try:
             meta_action_dist = Normal(gamma_offset_signal_mean, meta_action_std)
-            log_prob_meta_action = meta_action_dist.log_prob(self.last_gamma_offset_signal) # Use stored action
+            log_prob_meta_action = meta_action_dist.log_prob(self.last_gamma_offset_signal)
         except ValueError as e:
              print(f"ERROR creating Meta Normal distribution: {e}")
              self.last_meta_input_smoothed = None; self.last_gamma_offset_signal = None
@@ -517,11 +608,11 @@ class MetaModel(nn.Module):
         return policy_gradient_loss.item(), grad_norm
 
 
-# --- DPLD System (Unchanged from Rev 7 - Relies on module changes) ---
+# --- DPLD System (Minor changes for TaskHead learning) ---
 class DPLDSystem(nn.Module):
     """
     Main DPLD system coordinating CLS, Modules, Meta-Model, and Task components.
-    Uses combined loss for modules (Policy Loss for qm, Prediction Loss for fm).
+    Enables task-specific loss and reward for TaskHead.
     Uses LOG-SURPRISE for internal calculations.
     Includes EMA smoothing, weight decay, action mean clipping.
     """
@@ -530,11 +621,11 @@ class DPLDSystem(nn.Module):
                  env, embedding_dim,
                  entropy_coeff=0.01,
                  ema_alpha=0.99,
-                 gamma_min=0.01, gamma_max=0.2, stability_target=-100.0,
+                 gamma_min=0.01, gamma_max=0.2, stability_target=-0.01, # Updated default
                  action_std=DEFAULT_ACTION_STD,
-                 prediction_loss_weight=DEFAULT_PREDICTION_LOSS_WEIGHT, # Added
-                 task_loss_weight=0.0, # Task weight is 0
-                 weight_decay=1e-5, # Default weight decay
+                 prediction_loss_weight=DEFAULT_PREDICTION_LOSS_WEIGHT,
+                 task_loss_weight=DEFAULT_TASK_LOSS_WEIGHT, # Now used by TaskHead
+                 weight_decay=1e-5,
                  meta_input_dim=2, clip_cls_norm=True, device='cpu'):
         super().__init__()
         self.cls_dim = cls_dim
@@ -552,19 +643,20 @@ class DPLDSystem(nn.Module):
         op_vocab_size = self.env.get_num_ops()
         self.math_encoder = MathEncoder(num_vocab_size, op_vocab_size, embedding_dim, cls_dim, k_sparse_write, device).to(device)
 
+        # Pass task_loss_weight to TaskHead
         self.task_head = TaskHead(cls_dim, module_hidden_dim, k_sparse_write, module_lr,
                                   entropy_coeff=entropy_coeff,
                                   action_std=action_std,
-                                  prediction_loss_weight=prediction_loss_weight, # Pass weight
-                                  task_loss_weight=0.0, # Force 0
+                                  prediction_loss_weight=prediction_loss_weight,
+                                  task_loss_weight=task_loss_weight, # Pass the weight
                                   weight_decay=weight_decay, device=device).to(device)
 
         self.pred_modules = nn.ModuleList([
             PredictiveModule(cls_dim, module_hidden_dim, k_sparse_write, module_lr,
                              entropy_coeff=entropy_coeff,
                              action_std=action_std,
-                             prediction_loss_weight=prediction_loss_weight, # Pass weight
-                             task_loss_weight=0.0,
+                             prediction_loss_weight=prediction_loss_weight,
+                             task_loss_weight=0.0, # Base modules ignore this
                              weight_decay=weight_decay, device=device)
             for _ in range(num_modules)
         ])
@@ -619,6 +711,11 @@ class DPLDSystem(nn.Module):
 
     def get_dynamics_map(self, fixed_gamma, fixed_noise_std=0.0):
          """Returns a function for LE estimation (Unchanged)."""
+         # This function remains unchanged as it uses detached parameters
+         # and simulates the dynamics without learning.
+         # Note: It doesn't currently simulate the TaskHead's task prediction part,
+         # only the CLS prediction part, which might affect accuracy if task
+         # dynamics significantly influence CLS dynamics.
          gamma_val = float(fixed_gamma)
          generic_module_params = []
          for module in self.pred_modules:
@@ -642,6 +739,7 @@ class DPLDSystem(nn.Module):
              state_t_sparse = state_t_dense.detach().to_sparse_coo()
              sum_im = self._init_cls()
              with torch.no_grad():
+                 # Generic Modules
                  for params in generic_module_params:
                       x = state_t_sparse.to_dense()
                       try:
@@ -661,6 +759,7 @@ class DPLDSystem(nn.Module):
                       sparse_indices = torch.where(write_vector_im_sparse_vals != 0)[0].unsqueeze(0); sparse_values = write_vector_im_sparse_vals[sparse_indices.squeeze(0)]
                       if sparse_indices.numel() > 0: sum_im += torch.sparse_coo_tensor(sparse_indices, sparse_values, (self.cls_dim,), device=self.device, dtype=action_mean.dtype)
 
+                 # Task Head (CLS prediction part only for dynamics map)
                  params = task_head_params
                  try:
                      gru_layer = nn.GRU(params['cls_dim'], params['hidden_dim'], batch_first=True).to(self.device)
@@ -683,6 +782,7 @@ class DPLDSystem(nn.Module):
                  sparse_indices = torch.where(write_vector_im_sparse_vals != 0)[0].unsqueeze(0); sparse_values = write_vector_im_sparse_vals[sparse_indices.squeeze(0)]
                  if sparse_indices.numel() > 0: sum_im += torch.sparse_coo_tensor(sparse_indices, sparse_values, (self.cls_dim,), device=self.device, dtype=action_mean.dtype)
 
+                 # CLS Update
                  gamma_t = gamma_val; mmodt = self._init_cls()
                  next_state_sparse = self.cls_update_rule(state_t_sparse, sum_im.coalesce(), mmodt, gamma_t, fixed_noise_std)
                  next_state_dense = next_state_sparse.to_dense()
@@ -692,36 +792,35 @@ class DPLDSystem(nn.Module):
          return dynamics_map
 
     def step(self, current_step_num, task_input, estimate_le=False, true_answer_c=None):
-        """Performs one full step using LOG-SURPRISE and COMBINED module loss."""
+        """Performs one full step using LOG-SURPRISE and enabling TaskHead learning."""
 
-        a, op_idx, b, _ = task_input
+        a, op_idx, b, _ = task_input # True answer c is passed separately
 
         if not torch.all(torch.isfinite(self.ct.values())):
              print(f"Warning: CLS became non-finite at step {current_step_num}. Resetting CLS and states.")
              self.ct = self._init_cls()
              self.gt_log_ema = None; self.lambda_max_ema = None
              for module in self.pred_modules: module.sm_log_baseline.fill_(0.0); module.last_log_surprise_sm_cls = torch.tensor(0.0, device=self.device)
-             self.task_head.sm_log_baseline.fill_(0.0); self.task_head.last_log_surprise_sm_cls = torch.tensor(0.0, device=self.device)
+             self.task_head.sm_log_baseline.fill_(0.0); self.task_head.last_log_surprise_sm_cls = torch.tensor(0.0, device=self.device); self.task_head.last_log_surprise_sm_task = torch.tensor(0.0, device=self.device)
              self.task_head.last_gru_hidden_state = None
              self.meta_model.last_gru_hidden_state = None
 
         ct_prev_dense = self.ct.to_dense().detach()
 
-        # --- 1. Module Predictions (Needs grad for fm update) ---
+        # --- 1. Module Predictions ---
         all_modules = self.pred_modules + [self.task_head]
-        # module_predictions_sm = {} # Not needed explicitly
         for i, module in enumerate(all_modules):
-            _ = module.predict(self.ct) # Stores prediction internally
+            _ = module.predict(self.ct)
 
         # --- 2. Meta-Model Regulation ---
         gamma_t, mmod_t = self.meta_model.compute_regulation(self.gt_log_ema, self.lambda_max_ema)
 
-        # --- 3. Module Write Vectors (Needs grad for qm update) ---
+        # --- 3. Module Write Vectors ---
         sum_im = self._init_cls()
         i_math = self.math_encoder(a, op_idx, b)
         sum_im += i_math
         for i, module in enumerate(all_modules):
-             im = module.generate_write_vector(self.ct) # Stores log_prob internally
+             im = module.generate_write_vector(self.ct)
              sum_im += im
         sum_im = sum_im.coalesce()
 
@@ -729,21 +828,20 @@ class DPLDSystem(nn.Module):
         noise_std_dev = self.noise_std_dev_schedule(current_step_num)
         ct_plus_1 = self.cls_update_rule(self.ct, sum_im, mmod_t, gamma_t, noise_std_dev)
 
-        # --- 5. Calculate Actual LOG-Surprises (Needs grad for fm update) ---
-        # current_log_surprises_sm_grad = {} # Not needed explicitly
-        current_log_surprises_sm_detached = {} # Store detached surprise for reward/logging
-        log_surprises_sm_cls_detached = [] # Store detached CLS surprise for logging
-        raw_surprises_sm_cls_detached = [] # Store detached raw CLS surprise for logging
+        # --- 5. Calculate Actual LOG-Surprises ---
+        log_surprises_sm_cls_detached = []
+        raw_surprises_sm_cls_detached = []
         global_log_surprise_gt_sum = 0.0
         valid_surprises = 0
         for i, module in enumerate(all_modules):
-             _ = module.calculate_surprise(ct_plus_1, true_task_output=None) # Stores grad surprise internally, updates detached state
-             sm_log_detached = module.last_log_surprise_sm_cls # Use the detached CLS part
-             current_log_surprises_sm_detached[i] = sm_log_detached
-             log_surprises_sm_cls_detached.append(sm_log_detached)
+             # Pass true_answer_c only to TaskHead's surprise calculation
+             true_task = true_answer_c if module is self.task_head else None
+             _ = module.calculate_surprise(ct_plus_1, true_task_output=true_task)
+             sm_log_cls_detached = module.last_log_surprise_sm_cls # Use the detached CLS part
+             log_surprises_sm_cls_detached.append(sm_log_cls_detached)
              raw_surprises_sm_cls_detached.append(module.last_raw_surprise_sm_cls)
-             if math.isfinite(sm_log_detached.item()):
-                 global_log_surprise_gt_sum += sm_log_detached.item(); valid_surprises += 1
+             if math.isfinite(sm_log_cls_detached.item()):
+                 global_log_surprise_gt_sum += sm_log_cls_detached.item(); valid_surprises += 1
 
         global_log_surprise_gt = (global_log_surprise_gt_sum / valid_surprises) if valid_surprises > 0 else float('nan')
 
@@ -765,24 +863,25 @@ class DPLDSystem(nn.Module):
         if current_lambda_val is not None and math.isfinite(current_lambda_val):
              effective_lambda = current_lambda_val
         else:
-             effective_lambda = self.meta_model.stability_target # Use target if LE invalid
+             effective_lambda = self.meta_model.stability_target
 
         if self.lambda_max_ema is None: self.lambda_max_ema = effective_lambda
         else: self.lambda_max_ema = (1 - self.ema_alpha) * effective_lambda + self.ema_alpha * self.lambda_max_ema
 
-
         # --- 8. Trigger Meta-Model Learning ---
         meta_loss_item, meta_grad_norm = self.meta_model.learn(self.gt_log_ema, self.lambda_max_ema)
 
-        # --- 9. Trigger Module Learning (Combined Loss) ---
+        # --- 9. Trigger Module Learning ---
         module_total_losses = []
         module_policy_losses = []
         module_pred_losses = []
         module_entropies = []
         module_grad_norms = []
         for i, module in enumerate(all_modules):
-            local_sm_log_detached = current_log_surprises_sm_detached.get(i, None)
-            total_loss, policy_loss, pred_loss, entropy, grad_norm = module.learn(local_sm_log_detached)
+            # Base modules use detached CLS surprise for reward
+            # TaskHead uses detached TASK surprise for reward (handled internally in its learn method)
+            local_sm_log_cls_detached = log_surprises_sm_cls_detached[i]
+            total_loss, policy_loss, pred_loss, entropy, grad_norm = module.learn(local_sm_log_cls_detached) # Pass CLS surprise
             module_total_losses.append(total_loss)
             module_policy_losses.append(policy_loss)
             module_pred_losses.append(pred_loss)
@@ -792,7 +891,7 @@ class DPLDSystem(nn.Module):
         # --- 10. Update State ---
         self.ct = ct_plus_1
 
-        # --- 11. Return Metrics (Combined Loss, Task Disabled) ---
+        # --- 11. Return Metrics ---
         finite_sm_log_cls = [s.item() for s in log_surprises_sm_cls_detached if s is not None and math.isfinite(s.item())]
         finite_sm_raw_cls = [s.item() for s in raw_surprises_sm_cls_detached if s is not None and math.isfinite(s.item())]
         finite_total_losses = [l for l in module_total_losses if l is not None and math.isfinite(l)]
@@ -801,6 +900,10 @@ class DPLDSystem(nn.Module):
         finite_entropies = [e for e in module_entropies if e is not None and math.isfinite(e)]
         finite_module_grads = [g for g in module_grad_norms if g is not None and math.isfinite(g)]
 
+        # Get TaskHead specific surprises
+        task_sm_log = self.task_head.last_log_surprise_sm_task.item() if self.task_head.last_log_surprise_sm_task is not None else float('nan')
+        task_sm_raw = self.task_head.last_raw_surprise_sm_task.item() if self.task_head.last_raw_surprise_sm_task is not None else float('nan')
+
         metrics = {
             "Gt_log": global_log_surprise_gt if math.isfinite(global_log_surprise_gt) else float('nan'),
             "Gt_log_EMA": self.gt_log_ema,
@@ -808,6 +911,8 @@ class DPLDSystem(nn.Module):
             "Sm_log_std": np.std(finite_sm_log_cls) if len(finite_sm_log_cls) > 1 else 0.0,
             "Sm_log_cls_avg": np.mean(finite_sm_log_cls) if finite_sm_log_cls else float('nan'),
             "Sm_raw_cls_avg": np.mean(finite_sm_raw_cls) if finite_sm_raw_cls else float('nan'),
+            "TaskHead_Sm_log_task": task_sm_log if math.isfinite(task_sm_log) else float('nan'), # Added
+            "TaskHead_Sm_raw_task": task_sm_raw if math.isfinite(task_sm_raw) else float('nan'), # Added
             "lambda_max_est": lambda_max_estimate,
             "lambda_max_EMA": self.lambda_max_ema,
             "gamma_t": gamma_t,
