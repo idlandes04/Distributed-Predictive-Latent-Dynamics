@@ -9,6 +9,7 @@ import math
 import time # For Logger timestamp
 
 # --- Sparsification (Unchanged) ---
+# ... (keep sparsify_vector function as is) ...
 def sparsify_vector(dense_vector, k_sparse_factor):
     """Keeps top k% largest magnitude values, sets others to 0."""
     if not isinstance(dense_vector, torch.Tensor):
@@ -21,94 +22,136 @@ def sparsify_vector(dense_vector, k_sparse_factor):
     num_elements = dense_vector.numel()
     k = max(1, int(num_elements * k_sparse_factor)) # Ensure at least 1 element is kept
 
-    top_k_indices = torch.topk(dense_vector.abs(), k).indices
-    sparse_vector = torch.zeros_like(dense_vector)
-    sparse_vector[top_k_indices] = dense_vector[top_k_indices]
+    with torch.no_grad(): # Ensure this operation doesn't track gradients
+        top_k_indices = torch.topk(dense_vector.abs(), k).indices
+        sparse_vector = torch.zeros_like(dense_vector)
+        sparse_vector[top_k_indices] = dense_vector[top_k_indices]
     return sparse_vector
 
-# --- Lyapunov Exponent Estimation (Unchanged from Rev 9) ---
+
+# --- Lyapunov Exponent Estimation (MODIFIED Rev 11: Aggressive dtype casting) ---
 def estimate_lyapunov_exponent(dynamics_map_func, initial_state_dense, n_vectors=5, steps=50, delta_t=1.0, device='cpu'):
     """
     Estimates the largest Lyapunov exponent using Jacobian-vector products.
-    Args:
-        dynamics_map_func: A function that takes a dense state tensor and returns the next dense state tensor.
-        initial_state_dense: The starting state (dense tensor).
-        n_vectors: Number of perturbation vectors to track.
-        steps: Number of steps to iterate the dynamics and perturbations.
-        delta_t: Time step size (usually 1.0 for discrete maps).
-        device: PyTorch device.
-    Returns:
-        Estimated largest Lyapunov exponent (float), or None if unstable.
+    MODIFIED Rev 11: Uses float64 consistently and adds more checks.
     """
     dim = initial_state_dense.numel()
-    state = initial_state_dense.clone().detach().requires_grad_(False).to(device, dtype=torch.float64)
+    # Ensure initial state is float64 and detached
+    state = initial_state_dense.clone().detach().to(device=device, dtype=torch.float64).requires_grad_(False)
 
+    # Initialize orthogonal vectors in float64
     q = torch.randn(dim, n_vectors, device=device, dtype=torch.float64)
     q, _ = torch.linalg.qr(q)
 
     log_stretch_sum = torch.zeros(n_vectors, device=device, dtype=torch.float64)
 
     for step in range(steps):
+        # Prepare input for dynamics map, ensuring it requires grad
         state_input = state.clone().requires_grad_(True)
-        next_state = dynamics_map_func(state_input)
+
+        # Ensure dynamics map output is float64
+        next_state_raw = dynamics_map_func(state_input)
+        if not torch.is_tensor(next_state_raw):
+             print(f"Warning: Dynamics map did not return a tensor at step {step}. Aborting LE calc.")
+             return None
+        next_state = next_state_raw.to(dtype=torch.float64) # Cast output
 
         if not torch.all(torch.isfinite(next_state)):
-            print(f"Warning: Non-finite value encountered in LE estimation dynamics map at step {step}. Aborting LE calc.")
+            print(f"Warning: Non-finite value encountered in LE dynamics map output at step {step}. Aborting LE calc.")
             return None
 
-        v = q.clone()
+        v = q.clone() # Perturbation vectors (float64)
         jvp_results = []
 
         for i in range(n_vectors):
-            vector = v[:, i].requires_grad_(False)
+            vector = v[:, i].requires_grad_(False) # Ensure vector is float64 and detached
+
+            # Ensure gradients are cleared before backward pass
+            if state_input.grad is not None:
+                state_input.grad.zero_()
+
             try:
-                next_state.backward(vector.to(next_state.dtype), retain_graph=True if i < n_vectors - 1 else False)
-                jvp = state_input.grad.clone().detach()
-                if jvp is None or not torch.all(torch.isfinite(jvp)):
-                    print(f"Warning: Non-finite JVP for vector {i} at step {step}. Aborting LE calc.")
-                    if state_input.grad is not None: state_input.grad.zero_()
+                # Perform backward pass to get JVP
+                # Pass vector cast to the dtype of next_state's grad_fn output if necessary,
+                # but next_state itself should be float64 now.
+                next_state.backward(vector, retain_graph=True if i < n_vectors - 1 else False)
+
+                if state_input.grad is None:
+                    print(f"Warning: Gradient is None after backward for vector {i} at step {step}. Aborting LE calc.")
                     return None
+
+                # Clone, detach, and cast JVP result to float64
+                jvp = state_input.grad.clone().detach().to(dtype=torch.float64)
+
+                if not torch.all(torch.isfinite(jvp)):
+                    print(f"Warning: Non-finite JVP calculated for vector {i} at step {step}. Aborting LE calc.")
+                    return None
+
                 jvp_results.append(jvp)
-                if state_input.grad is not None: state_input.grad.zero_() # Ensure grad is zeroed after use
+
             except RuntimeError as e:
-                 print(f"Error during JVP calculation for vector {i} at step {step}: {e}. Aborting LE calc.")
+                 print(f"Error during JVP calculation (backward pass) for vector {i} at step {step}: {e}. Aborting LE calc.")
+                 traceback.print_exc() # Print full traceback
+                 return None
+            except Exception as e: # Catch other potential errors
+                 print(f"Unexpected error during JVP calculation for vector {i} at step {step}: {e}. Aborting LE calc.")
+                 traceback.print_exc()
                  return None
 
+        # --- Check JVP results ---
         if len(jvp_results) != n_vectors:
-            print(f"Warning: Incorrect number of JVP results ({len(jvp_results)} vs {n_vectors}). Aborting LE calc.")
+            print(f"Warning: Incorrect number of JVP results obtained ({len(jvp_results)} vs {n_vectors}). Aborting LE calc.")
             return None
 
+        # Stack results (should be float64)
         z = torch.stack(jvp_results, dim=1)
+        if z.dtype != torch.float64:
+            print(f"Warning: Stacked JVP tensor 'z' has unexpected dtype {z.dtype}. Casting.")
+            z = z.to(dtype=torch.float64)
 
+        # --- QR Decomposition ---
         try:
             q_new, r = torch.linalg.qr(z)
-        except torch._C._LinAlgError as e:
-            print(f"Warning: QR decomposition failed at step {step}: {e}. Aborting LE calc.")
+            # Ensure outputs are float64
+            q_new = q_new.to(dtype=torch.float64)
+            r = r.to(dtype=torch.float64)
+        except Exception as e: # Catch potential LinAlgError or others
+            print(f"Error during QR decomposition at step {step}: {e}. Aborting LE calc.")
+            traceback.print_exc()
             return None
+
         if not torch.all(torch.isfinite(r)):
-            print(f"Warning: Non-finite values in R matrix at step {step}. Aborting LE calc.")
+            print(f"Warning: Non-finite values in R matrix after QR at step {step}. Aborting LE calc.")
             return None
 
         diag_r = torch.diag(r)
-        if torch.any(diag_r.abs() < 1e-10) or not torch.all(torch.isfinite(diag_r)):
-             print(f"Warning: Invalid diagonal elements in R (zero, NaN, Inf) at step {step}: {diag_r}. Aborting LE calc.")
+        # Check for zeros or non-finite values on diagonal of R
+        # Use a small tolerance for zero check
+        if torch.any(diag_r.abs() < EPSILON) or not torch.all(torch.isfinite(diag_r)):
+             print(f"Warning: Invalid diagonal elements in R (near-zero, NaN, Inf) at step {step}: {diag_r}. Aborting LE calc.")
              return None
 
+        # Update sum of log stretches (use abs for safety, though R diagonal should be positive)
         log_stretch_sum += torch.log(diag_r.abs())
-        q = q_new
-        state = next_state.detach().requires_grad_(False).to(dtype=torch.float64)
+        q = q_new # Update orthogonal vectors
 
+        # Update state for next iteration, ensure it's float64 and detached
+        state = next_state.detach().requires_grad_(False)
+
+    # Final calculation
     lyapunov_exponents = log_stretch_sum / (steps * delta_t)
 
-    largest_le = torch.max(lyapunov_exponents).item()
-    if not math.isfinite(largest_le):
-        print(f"Warning: Final LE calculation resulted in non-finite value: {largest_le}")
+    if not torch.all(torch.isfinite(lyapunov_exponents)):
+        print(f"Warning: Final LE calculation resulted in non-finite exponents: {lyapunov_exponents}")
         return None
+
+    largest_le = torch.max(lyapunov_exponents).item()
 
     return largest_le
 
 
 # --- Noise Schedule (Unchanged) ---
+# ... (keep linear_noise_decay function as is) ...
 def linear_noise_decay(current_step, total_steps, start_noise, end_noise):
     """Linearly decays noise from start_noise to end_noise over total_steps."""
     if current_step >= total_steps:
@@ -117,7 +160,8 @@ def linear_noise_decay(current_step, total_steps, start_noise, end_noise):
     return start_noise - fraction * (start_noise - end_noise)
 
 
-# --- Logging (Revised Header for Rev 10) ---
+# --- Logging (Unchanged Header from Rev 10) ---
+# ... (keep Logger class as is) ...
 class Logger:
     def __init__(self, log_dir="logs"):
         self.log_dir = log_dir
@@ -156,16 +200,25 @@ class Logger:
 
         df = pd.DataFrame(self.metrics)
         try:
+            # Ensure columns match the header order, fill missing with NaN
             header_cols = pd.read_csv(self.log_file, nrows=0).columns.tolist()
             df = df.reindex(columns=header_cols)
+        except FileNotFoundError:
+             print(f"Log file {self.log_file} not found. Creating with current columns.")
+             # Fallback: use DataFrame columns if header read fails
+             pass
         except Exception as e:
             print(f"Warning: Could not read header from log file {self.log_file}. Saving with DataFrame columns. Error: {e}")
+             # Fallback: use DataFrame columns if header read fails
+            pass
+
 
         df.to_csv(self.log_file, mode='a', header=False, index=False, na_rep='NaN')
-        self.metrics = []
+        self.metrics = [] # Clear buffer after saving
 
 
-# --- Plotting (Revised for Rev 10 Metrics) ---
+# --- Plotting (Unchanged from Rev 10) ---
+# ... (keep plot_metrics function as is) ...
 def plot_metrics(log_file_path):
     """Generates and saves plots from the metrics log file."""
     try:
@@ -224,7 +277,7 @@ def plot_metrics(log_file_path):
                     # Find min/max excluding potential outliers if needed
                     min_val = valid_data[col].min()
                     max_val = valid_data[col].max()
-                    padding = max(0.01, (max_val - min_val) * 0.1)
+                    padding = max(0.01, (max_val - min_val) * 0.1) if max_val > min_val else 0.01
                     ax.set_ylim(min_val - padding, max_val + padding)
 
             else:
@@ -236,14 +289,15 @@ def plot_metrics(log_file_path):
             ax.text(0.5, 0.5, 'Plotting Error', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
         plot_idx += 1
 
+    # Remove unused subplots
     for i in range(plot_idx, len(axes)):
         fig.delaxes(axes[i])
 
     plt.suptitle(f"DPLD Run Metrics ({os.path.basename(log_file_path)})", fontsize=16, y=1.02)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98]) # Adjust layout
 
     try:
         plt.savefig(plot_file_path)
-        plt.close(fig)
+        plt.close(fig) # Close the figure to free memory
     except Exception as e:
         print(f"Error saving plot to {plot_file_path}: {e}")
